@@ -156,12 +156,8 @@ pub extern "system" fn XMemVirtualAlloc(
     let mut at = allocate(&mut parameter);
     // A 32-bit request that found no room below 4 GiB: the guards there
     // make way for it.
-    while at.is_null() && constrained && highest < FOUR_GIB {
-        let Some(released) = low_guards::release(size) else {
-            break;
-        };
-        at = allocate(&mut parameter);
-        low_guards::reguard(released);
+    if at.is_null() && constrained && highest < FOUR_GIB {
+        at = low_guards::retry(size, || allocate(&mut parameter));
     }
     if base.is_null() {
         tracing::debug!(
@@ -1553,41 +1549,74 @@ pub mod low_guards {
         );
     }
 
-    /// Releases a guard of at least `bytes` (the largest if none is that
-    /// big, so the request may fit in what it joins); what was released,
-    /// or `None` if there are no guards left.
-    pub(crate) fn release(bytes: usize) -> Option<(usize, usize)> {
-        let mut guards = guards();
-        let i = guards
-            .iter()
-            .enumerate()
-            .filter(|(_, g)| g.1 >= bytes)
-            .min_by_key(|(_, g)| g.1)
-            .or_else(|| guards.iter().enumerate().max_by_key(|(_, g)| g.1))?
-            .0;
-        let (base, size) = guards.swap_remove(i);
-        // SAFETY: our own reservation, nothing inside it.
-        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-        Some((base, size))
-    }
+    /// Try the smallest fitting guards first, then try smaller guards in
+    /// descending size order. A replacement guard cannot be retried here.
+    pub(crate) fn retry(
+        bytes: usize,
+        mut allocate: impl FnMut() -> *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 
-    /// Guards again what is still free of a released guard.
-    pub(crate) fn reguard((base, bytes): (usize, usize)) {
+        // Preserve the allocation error across address queries and reservations.
+        let mut error = unsafe { GetLastError() };
         let mut guards = guards();
-        for (start, size) in free_runs(base, base + bytes) {
-            if guard(start, size) {
-                guards.push((start, size));
+        let mut candidates = guards.clone();
+        candidates.sort_unstable_by_key(|&(_, size)| {
+            let fits = size >= bytes;
+            (!fits, if fits { size } else { usize::MAX - size })
+        });
+        for (base, size) in candidates {
+            // SAFETY: our own reservation, with no allocations inside it.
+            if unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } == 0 {
+                continue;
+            }
+            guards.retain(|&(b, _)| b != base);
+            let at = allocate();
+            error = unsafe { GetLastError() };
+            for (start, len) in free_runs(base, base + size) {
+                if guard(start, len) {
+                    guards.push((start, len));
+                }
+            }
+            if !at.is_null() {
+                return at;
             }
         }
+        unsafe { SetLastError(error) };
+        std::ptr::null_mut()
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
 
+        static TEST: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn a_refused_retry_leaves_the_guards_in_place() {
+            let _one = TEST.lock().unwrap();
+            let hole = unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) };
+            assert!(!hole.is_null());
+            let first = hole as usize;
+            assert_ne!(unsafe { VirtualFree(hole, 0, MEM_RELEASE) }, 0);
+            assert!(guard(first, 4 * GRANULE));
+            guards().push((first, 4 * GRANULE));
+            let mut attempts = 0;
+            let result = retry(4 * GRANULE, || {
+                attempts += 1;
+                std::ptr::null_mut()
+            });
+            assert!(result.is_null());
+            assert_eq!(attempts, 1);
+            assert!(guards().contains(&(first, 4 * GRANULE)));
+            guards().retain(|&(base, _)| base != first);
+            assert_ne!(unsafe { VirtualFree(hole, 0, MEM_RELEASE) }, 0);
+        }
+
         /// A released guard is guarded again around what took part of it.
         #[test]
         fn a_released_guard_is_guarded_again_around_what_took_it() {
+            let _one = TEST.lock().unwrap();
             // A known hole of four granules: reserved, then freed.
             // SAFETY: a fresh reservation, released at once.
             let hole =
@@ -1598,25 +1627,11 @@ pub mod low_guards {
             unsafe { VirtualFree(hole as *mut _, 0, MEM_RELEASE) };
             assert!(guard(hole, 4 * GRANULE));
             guards().push((hole, 4 * GRANULE));
-            let mut others = Vec::new();
-            let released = loop {
-                let r = release(4 * GRANULE).expect("a guard");
-                if r.0 == hole {
-                    break r;
-                }
-                others.push(r);
-            };
-            for (b, n) in others {
-                assert!(guard(b, n));
-                guards().push((b, n));
-            }
-            // Something takes the first granule; the rest is guarded again.
-            // SAFETY: free address space just released.
-            let taken =
+            let taken = retry(GRANULE, || {
+                // SAFETY: a reservation of the first granule at a known address.
                 unsafe { VirtualAlloc(hole as *const _, GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
-                    as usize;
+            }) as usize;
             assert_eq!(taken, hole);
-            reguard(released);
             assert!(guards().contains(&(hole + GRANULE, 3 * GRANULE)));
             guards().retain(|&(b, _)| b != hole + GRANULE);
             // SAFETY: ours.
