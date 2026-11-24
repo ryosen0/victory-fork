@@ -1558,6 +1558,7 @@ pub mod low_guards {
         use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 
         // Preserve the allocation error across address queries and reservations.
+        // SAFETY: reads this thread's last-error value.
         let mut error = unsafe { GetLastError() };
         let mut guards = guards();
         let mut candidates = guards.clone();
@@ -1572,6 +1573,7 @@ pub mod low_guards {
             }
             guards.retain(|&(b, _)| b != base);
             let at = allocate();
+            // SAFETY: reads this thread's last-error value.
             error = unsafe { GetLastError() };
             for (start, len) in free_runs(base, base + size) {
                 if guard(start, len) {
@@ -1582,6 +1584,7 @@ pub mod low_guards {
                 return at;
             }
         }
+        // SAFETY: sets this thread's last-error value.
         unsafe { SetLastError(error) };
         std::ptr::null_mut()
     }
@@ -1595,9 +1598,12 @@ pub mod low_guards {
         #[test]
         fn a_refused_retry_leaves_the_guards_in_place() {
             let _one = TEST.lock().unwrap();
-            let hole = unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) };
+            // SAFETY: a fresh reservation, released at once.
+            let hole =
+                unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) };
             assert!(!hole.is_null());
             let first = hole as usize;
+            // SAFETY: ours.
             assert_ne!(unsafe { VirtualFree(hole, 0, MEM_RELEASE) }, 0);
             assert!(guard(first, 4 * GRANULE));
             guards().push((first, 4 * GRANULE));
@@ -1610,6 +1616,7 @@ pub mod low_guards {
             assert_eq!(attempts, 1);
             assert!(guards().contains(&(first, 4 * GRANULE)));
             guards().retain(|&(base, _)| base != first);
+            // SAFETY: the guard the retry put back, ours.
             assert_ne!(unsafe { VirtualFree(hole, 0, MEM_RELEASE) }, 0);
         }
 
