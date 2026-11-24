@@ -103,6 +103,20 @@ enum Command {
         #[arg(long)]
         isa: bool,
     },
+    /// Survey mesh (and with --compute, compute) programs: group shape, LDS,
+    /// barriers, divergent barriers.
+    Meshdump {
+        paths: Vec<PathBuf>,
+        /// Only containers whose 16-hex content hash is listed.
+        #[arg(long = "hash")]
+        hashes: Vec<String>,
+        /// Also print the decoded GFX10 instructions of each program.
+        #[arg(long)]
+        isa: bool,
+        /// Also survey compute programs (group dims, LDS, barriers).
+        #[arg(long)]
+        compute: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -185,7 +199,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Meshdump { paths, hashes, isa } => meshdump::run(paths, hashes, isa),
+        Command::Meshdump { paths, hashes, isa, compute } => meshdump::run(paths, hashes, isa, compute),
         Command::Run {
             exe,
             unimplemented,

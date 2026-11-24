@@ -1,9 +1,9 @@
-//! Mesh-shader survey: per container, the mesh program's group shape, LDS,
-//! barrier count, and whether any barrier sits in a block only some lanes
+//! Mesh- and compute-shader survey: per container, the program's group shape,
+//! LDS, barrier count, and whether any barrier sits in a block only some lanes
 //! reach (a lane-dependent branch dominates the path to it). On a host whose
 //! wave is narrower than the console's, such a barrier deadlocks the group.
 //!
-//! `victory meshdump [paths] [--hash <16 hex>] [--isa]`
+//! `victory meshdump [paths] [--hash <16 hex>] [--isa] [--compute]`
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use victory_shader::{Container, FourCC, HwStage, gfx10, ir, native::StageIo, nat
 
 use crate::shader::{MAX_FILE, sources};
 
-pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool) -> Result<()> {
+pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool, compute: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let want: HashSet<String> = hashes.into_iter().collect();
     let mut seen = HashSet::new();
@@ -44,8 +44,22 @@ pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool) -> Result<()> {
                 let Ok(c) = Container::parse(&bytes) else { continue };
                 let Some(dxil) = c.part(FourCC::DXIL) else { continue };
                 let Ok(programs) = native_programs(dxil.data) else { continue };
-                for n in programs.into_iter().filter(|p| p.stage == HwStage::Ms) {
-                    let StageIo::Ms(ms) = &n.io else { continue };
+                for n in programs.into_iter().filter(|p| {
+                    p.stage == HwStage::Ms || (compute && p.stage == HwStage::Cs)
+                }) {
+                    // The group shape line differs by stage; the barrier
+                    // analysis below is the same for both.
+                    let shape = match &n.io {
+                        StageIo::Ms(ms) => format!(
+                            "ms threads={} lds={} verts={} prims={}",
+                            ms.threads, ms.lds_bytes, ms.max_vertices, ms.max_primitives
+                        ),
+                        StageIo::Cs(cs) => format!(
+                            "cs threads={}x{}x{} lds={}",
+                            cs.threads[0], cs.threads[1], cs.threads[2], cs.lds_bytes()
+                        ),
+                        _ => continue,
+                    };
                     total += 1;
                     let Ok(insts) = gfx10::decode(&n.code) else { continue };
                     let barriers: Vec<usize> = insts
@@ -54,10 +68,7 @@ pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool) -> Result<()> {
                         .map(|i| i.offset)
                         .collect();
                     if barriers.is_empty() {
-                        println!(
-                            "{hash} threads={} lds={} verts={} prims={} wave64={} barriers=0",
-                            ms.threads, ms.lds_bytes, ms.max_vertices, ms.max_primitives, n.wave64
-                        );
+                        println!("{hash} {shape} wave64={} barriers=0", n.wave64);
                         continue;
                     }
                     with_barriers += 1;
@@ -109,11 +120,7 @@ pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool) -> Result<()> {
                         }
                     }
                     println!(
-                        "{hash} threads={} lds={} verts={} prims={} wave64={} barriers={} {} lane_branches={}",
-                        ms.threads,
-                        ms.lds_bytes,
-                        ms.max_vertices,
-                        ms.max_primitives,
+                        "{hash} {shape} wave64={} barriers={} {} lane_branches={}",
                         n.wave64,
                         barriers.len(),
                         verdict,
@@ -132,7 +139,7 @@ pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool) -> Result<()> {
             }
         }
     }
-    println!("mesh programs {total}, with barriers {with_barriers}, divergent-barrier {divergent}");
+    println!("programs {total}, with barriers {with_barriers}, divergent-barrier {divergent}");
     Ok(())
 }
 
