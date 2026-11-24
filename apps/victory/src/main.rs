@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod meshdump;
 mod run;
 mod shader;
 mod translate;
@@ -92,6 +93,16 @@ enum Command {
         #[arg(long)]
         warm: Option<PathBuf>,
     },
+    /// Survey mesh programs: group shape, LDS, barriers, divergent barriers.
+    Meshdump {
+        paths: Vec<PathBuf>,
+        /// Only containers whose 16-hex content hash is listed.
+        #[arg(long = "hash")]
+        hashes: Vec<String>,
+        /// Also print the decoded GFX10 instructions of each mesh program.
+        #[arg(long)]
+        isa: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -174,6 +185,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Meshdump { paths, hashes, isa } => meshdump::run(paths, hashes, isa),
         Command::Run {
             exe,
             unimplemented,
