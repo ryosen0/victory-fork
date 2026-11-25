@@ -4313,21 +4313,31 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether a read of another lane of this lane's quad must reach helper
-    /// lanes: in a pixel shader, always. At a triangle's edge the quad's
-    /// other pixels are helpers (and so are discarded ones), which only quad
-    /// reads see: wave reads give 0 from them on AMD, so a derivative taken
-    /// by hand (`quad_perm`) was the whole value there, the texture read
-    /// that used it took its smallest level, and the triangles' edges showed
-    /// as lines on car paint, glass and skin. Upstream does this after
-    /// discards only (77053a0).
+    /// lanes. On AMD wave reads give 0 from a helper lane, so a derivative
+    /// taken by hand (`quad_perm`) at a triangle's edge was the whole value
+    /// there, the texture read that used it took its smallest level, and the
+    /// edges showed as lines on car paint, glass and skin. Reading the quad
+    /// through quad reads instead fixes that (code by beloooo,
+    /// [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD),
+    /// commit `03629f3`, GPL-3.0-or-later, carried here with credit).
     ///
-    /// Code by beloooo ([Belobug/VIctory-Belobug-AMD](
-    /// https://github.com/Belobug/VIctory-Belobug-AMD), commit `03629f3`),
-    /// GPL-3.0-or-later, carried here with credit. On NVIDIA helper lanes
-    /// are not zeroed the same way, but the manual-derivative defect is
-    /// vendor-independent; A/B on the owner's card decides.
+    /// Off on this fork unless `VICTORY_QUAD_HELPERS=1`. Two reasons, both
+    /// measured or read here rather than assumed:
+    /// - the defect is AMD's zeroing of helper lanes; on NVIDIA (this fork's
+    ///   card) a wave read is not documented to lose them, so the fix may
+    ///   have nothing to fix;
+    /// - `quad_pick` costs 4 `quadReadLaneAt` + 4 compares + 4 selects for
+    ///   what `read_lane` does in one instruction, and this applies it to
+    ///   every quad-local read of every pixel program. Runs with it on were
+    ///   slower with no picture gain the owner could see (own7/own8).
+    ///
+    /// `VICTORY_QUAD_HELPERS=1` is the A/B lever; the mesh path keeps its own
+    /// quad reads regardless (host quads are threads 4n..4n+3 there).
     fn helpers_read(&self, quad: bool) -> bool {
-        quad && self.s.pixel
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        quad
+            && self.s.pixel
+            && *ON.get_or_init(|| std::env::var_os("VICTORY_QUAD_HELPERS").is_some_and(|v| v == "1"))
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
