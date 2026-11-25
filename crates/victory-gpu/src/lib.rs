@@ -18,6 +18,8 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod cardmeter;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
