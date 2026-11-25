@@ -531,6 +531,10 @@ pub(crate) struct GatherSet {
     pub(crate) kind: u32,
     pub(crate) stride: u32,
     pub(crate) scratch: ID3D12Resource,
+    /// The state the scratch buffer is in as this recording begins: common
+    /// for a fresh one, indirect arguments for a spare an earlier
+    /// recording's pass filled ([`crate::host`]'s `Gather::spare`).
+    pub(crate) before: D3D12_RESOURCE_STATES,
     table_gpu: u64,
     table: usize,
     /// A record's offset in the buffer, and its slot.
@@ -542,8 +546,8 @@ pub(crate) struct GatherSet {
 unsafe impl Send for GatherSet {}
 
 impl GatherSet {
-    pub(crate) fn new(src: ID3D12Resource, src_id: u64, (kind, stride): (u32, u32), scratch: ID3D12Resource, (table_gpu, table): (u64, *mut u8)) -> Self {
-        Self { src, src_id, kind, stride, scratch, table_gpu, table: table as usize, slots: Default::default() }
+    pub(crate) fn new(src: ID3D12Resource, src_id: u64, (kind, stride): (u32, u32), (scratch, before): (ID3D12Resource, D3D12_RESOURCE_STATES), (table_gpu, table): (u64, *mut u8)) -> Self {
+        Self { src, src_id, kind, stride, scratch, before, table_gpu, table: table as usize, slots: Default::default() }
     }
 
     /// The records gathered so far.
@@ -631,6 +635,8 @@ fn record_gather_as(
     src: &ID3D12Resource,
     table_gpu: u64,
     (kind, stride, records): (u32, u32, u32),
+    skip_first_wait: bool,
+    skip_second_wait: bool,
 ) -> bool {
     // SAFETY: live D3D12 buffer resources.
     let (src_gpu, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
@@ -653,9 +659,11 @@ fn record_gather_as(
     // table, scratch destination and budget buffers. The first wait puts
     // the pass behind every earlier shader write (the title's argument
     // passes of the lists before); the second puts the list's draws behind
-    // the pass.
+    // the pass. Between the gathers of one prelude either may be elided
+    // ([`record_gathers`]): the sets write different scratch buffers, and
+    // one wait at each end of the window orders them all.
     unsafe {
-        l.ResourceBarrier(&first);
+        l.ResourceBarrier(&first[usize::from(skip_first_wait)..]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -664,7 +672,7 @@ fn record_gather_as(
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&second);
+        l.ResourceBarrier(&second[usize::from(skip_second_wait)..]);
     }
     true
 }
@@ -675,30 +683,76 @@ fn record_gather_as(
 /// list's own clamps zero and charge theirs inside the list, after this).
 /// False if anything could not be recorded: the slots then hold no clamped
 /// records and the list must not run.
+///
+/// Each set's scratch ends readable as indirect arguments and is left so
+/// until the list's reset ([`HostList::indirect_readable`]): a scratch of
+/// an earlier recording ([`Gather::spare`]) comes back in that state, and
+/// its next pass transitions from it, not from common. Between the sets
+/// the global UAV waits are elided (`VICTORY_INDIRECT_GATHER_ELIDE=0` keeps
+/// them): each set writes its own scratch and reads only its own source
+/// and table, so one wait before the first pass and one after the last
+/// order the whole window; the state transitions stay (PR #220's barrier
+/// elision, applied where it is safe — between clamps into one scratch the
+/// waits stay, they order the writes).
 pub(crate) fn record_gathers(l: &ID3D12GraphicsCommandList, sets: &[GatherSet], budget: &ID3D12Resource) -> bool {
+    let Some(c) = clamp() else {
+        return false;
+    };
+    record_gathers_with(c, l, sets, budget)
+}
+
+/// [`record_gathers`] with the clamp given (the tests' is compiled on
+/// their own device: a pipeline of another device records nothing).
+fn record_gathers_with(c: &Clamp, l: &ID3D12GraphicsCommandList, sets: &[GatherSet], budget: &ID3D12Resource) -> bool {
     use windows::core::Interface;
-    let (Some(c), Ok(l2)) = (clamp(), l.cast::<ID3D12GraphicsCommandList2>()) else {
+    let Ok(l2) = l.cast::<ID3D12GraphicsCommandList2>() else {
         return false;
     };
     // SAFETY: a live buffer.
     let at = unsafe { budget.GetGPUVirtualAddress() };
     let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + offset, Value: 0 });
     // SAFETY: an open list; the budget buffer is the list's own and common
-    // between its runs.
+    // between its runs. The wait before the zeroing puts it behind every
+    // earlier shader write (the passes of the lists before, and this
+    // list's own earlier work): with the waits between the passes elided,
+    // it is the one ordering the whole window needs at its start.
     unsafe {
-        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(budget, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+        ]);
         l2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
         l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
     }
+    let live: Vec<usize> = sets.iter().enumerate().filter(|(_, s)| s.records() > 0).map(|(i, _)| i).collect();
     let mut all = true;
-    for set in sets.iter().filter(|s| s.records() > 0) {
-        all &= record_gather_as(c, l, (&set.scratch, D3D12_RESOURCE_STATE_COMMON), at, &set.src, set.table_gpu, (set.kind, set.stride, set.records()));
+    for (n, &i) in live.iter().enumerate() {
+        let set = &sets[i];
+        all &= record_gather_as(
+            c,
+            l,
+            (&set.scratch, set.before),
+            at,
+            &set.src,
+            set.table_gpu,
+            (set.kind, set.stride, set.records()),
+            gather_elide() && n != 0,
+            gather_elide() && n + 1 != live.len(),
+        );
     }
     // SAFETY: as above.
     unsafe {
         l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)]);
     }
     all
+}
+
+/// Whether the gathers of one prelude elide the global UAV waits between
+/// their passes (on by default; `VICTORY_INDIRECT_GATHER_ELIDE=0` keeps a
+/// wait on both sides of every pass, as before).
+fn gather_elide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_GATHER_ELIDE").is_none_or(|v| v != "0"))
 }
 
 /// Whether every draw served from a window is checked against a fresh
@@ -1644,6 +1698,8 @@ void main() {
             &src_buf,
             table_gpu,
             (KIND_MESH, STRIDE, records.len() as u32),
+            false,
+            false,
         ));
         // SAFETY: an open list; the scratch buffer, which the pass left
         // readable as arguments, is copied for the check.
@@ -1674,6 +1730,99 @@ void main() {
         // The source is read only.
         // SAFETY: a mapped buffer.
         assert_eq!(unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), total) }, &src[..]);
+    }
+
+    /// Two gathers in one prelude, with the waits between them elided
+    /// ([`gather_elide`]): each slot holds its record clamped as if alone.
+    /// Then the same scratch buffers come back as spares — in indirect
+    /// arguments, the state their last pass left them in — and a second
+    /// prelude transitions from it and refills them.
+    #[test]
+    fn warp_gathers_elide_the_waits_between_and_refill_their_spares() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 12;
+        let want: [[u32; 3]; 3] = [[5, 1, 1], [519, 1, 1], [7, 1, 1]];
+        let bytes = (STRIDE * want.len() as u32) as u64;
+        let mut src = vec![0u8; bytes as usize];
+        for (i, words) in want.into_iter().enumerate() {
+            for (w, word) in words.into_iter().enumerate() {
+                let at = i * STRIDE as usize + w * 4;
+                src[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let (src_buf, src_ptr, _) = warp.shared_buffer(bytes);
+        let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(u64::from(GATHER_MOST) * 4);
+        let (budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(bytes * 2);
+        let scratch_a = warp.default_uav(bytes);
+        let scratch_b = warp.default_uav(bytes);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, bytes as usize);
+            std::ptr::write_bytes(table_ptr, 0, GATHER_MOST as usize * 4);
+            for i in 0..want.len() {
+                (table_ptr as *mut u32).add(i).write_volatile((i * STRIDE as usize) as u32);
+            }
+            std::ptr::write_bytes(readback_ptr, 0xEE, (bytes * 2) as usize);
+        }
+        let set = |scratch: ID3D12Resource, before: D3D12_RESOURCE_STATES| {
+            let mut s = GatherSet::new(src_buf.clone(), 7, (KIND_MESH, STRIDE), (scratch, before), (table_gpu, table_ptr));
+            for i in 0..want.len() {
+                assert_eq!(s.slot((i * STRIDE as usize) as u32), Some(i as u32));
+            }
+            s
+        };
+        for pass in 0..2 {
+            // The first prelude takes fresh scratch (common); the second
+            // takes the same buffers back as spares, in the state the
+            // first prelude's passes left them: indirect arguments.
+            let before = if pass == 0 {
+                D3D12_RESOURCE_STATE_COMMON
+            } else {
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+            };
+            let sets = [set(scratch_a.clone(), before), set(scratch_b.clone(), before)];
+            assert!(record_gathers_with(&warp.clamp, &warp.list, &sets, &budget_buf));
+            // SAFETY: an open list; both scratch buffers were left readable
+            // as arguments by their passes.
+            unsafe {
+                for scratch in [&scratch_a, &scratch_b] {
+                    warp.list.ResourceBarrier(&[transition(
+                        scratch,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                }
+                warp.list.CopyBufferRegion(&readback_buf, 0, &scratch_a, 0, bytes);
+                warp.list.CopyBufferRegion(&readback_buf, bytes, &scratch_b, 0, bytes);
+                for scratch in [&scratch_a, &scratch_b] {
+                    warp.list.ResourceBarrier(&[transition(
+                        scratch,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    )]);
+                }
+            }
+            warp.submit_and_wait();
+            // SAFETY: the work is done; a mapped buffer.
+            let out = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), want.len() * 3 * 2).to_vec() };
+            let spent = unsafe { (budget_ptr as *const u32).read_volatile() };
+            assert_eq!(spent, (5 + 519 + 7) * 128 * 2, "pass {pass}: both sets charged once each, out {out:?}");
+            for (slot, w) in want.iter().enumerate() {
+                assert_eq!(&out[slot * 3..slot * 3 + 3], w, "pass {pass}, scratch A slot {slot}");
+                let b = want.len() * 3 + slot * 3;
+                assert_eq!(&out[b..b + 3], w, "pass {pass}, scratch B slot {slot}");
+            }
+            // `submit_and_wait` resets the list as a host list's reset does;
+            // the scratch buffers keep their state (indirect arguments)
+            // for the next recording, as `Gather::spare` carries it.
+        }
+        // SAFETY: mapped tables are read-only to the passes.
+        let table = unsafe { std::slice::from_raw_parts(table_ptr.cast::<u32>().cast_const(), want.len()).to_vec() };
+        assert_eq!(table, [0, STRIDE, STRIDE * 2]);
     }
 
     #[test]
@@ -1837,13 +1986,12 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
-        let mut kept = 0usize;
+        let mut kept: Vec<usize> = Vec::new();
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
-                kept += 1;
+                kept.push(i);
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
                 zeroed += 1;
@@ -1853,7 +2001,14 @@ void main() {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        // Which group charges first is the card's to decide (WARP schedules
+        // the two groups in either order): the two real draws that fit are
+        // the first two of whichever group won — adjacent, in lane order,
+        // and never record 0 (2^24 indices: no draw, no charge).
+        assert_eq!(kept.len(), 2, "two real draws fit the budget: {kept:?}");
+        assert_eq!(kept[1], kept[0] + 1, "the group's records charge in lane order: {kept:?}");
+        assert!(kept[0] >= 1, "record 0 is no draw: {kept:?}");
+        assert_eq!(zeroed, (RECORDS as usize) - 2);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's

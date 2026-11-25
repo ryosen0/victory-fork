@@ -903,8 +903,11 @@ struct Gather {
     sets: Vec<crate::indirect::GatherSet>,
     /// The budget words the gathered records are charged to.
     budget: Option<ID3D12Resource>,
-    /// Scratch buffers of earlier recordings, kept for the next sets.
-    spare: Vec<ID3D12Resource>,
+    /// Scratch buffers of earlier recordings, kept for the next sets, with
+    /// the state their last pass left them in: a filled scratch is readable
+    /// as indirect arguments until something else moves it, and the next
+    /// recording's pass transitions from that state, not from common.
+    spare: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
 }
 
 /// The most argument buffers a list gathers from.
@@ -6009,18 +6012,10 @@ impl HostList {
             self.indirect_common(&scratch);
         }
         self.card_budget_out();
-        // The scratch buffers its prelude fills and leaves readable as
-        // arguments: common again behind the list, as every scratch buffer.
-        for set in self.gather.lock().unwrap_or_else(|e| e.into_inner()).sets.iter().filter(|s| s.records() > 0) {
-            // SAFETY: an open list and a live buffer.
-            unsafe {
-                self.list.ResourceBarrier(&[transition(
-                    &set.scratch,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                    D3D12_RESOURCE_STATE_COMMON,
-                )]);
-            }
-        }
+        // The gather scratch buffers stay readable as indirect arguments
+        // until the list's reset: their draws run after this list closes,
+        // and the next recording's prelude transitions from that state
+        // (`Gather::spare` carries it), so no barrier is recorded here.
         crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
         crate::cardmeter::end_named(
             &self.list,
@@ -6060,7 +6055,14 @@ impl HostList {
             *closed = false;
             for set in sets.drain(..) {
                 if spare.len() < GATHER_SETS {
-                    spare.push(set.into_scratch());
+                    // A filled scratch was left readable as arguments; an
+                    // empty one was never written and is still common.
+                    let state = if set.records() > 0 {
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+                    } else {
+                        D3D12_RESOURCE_STATE_COMMON
+                    };
+                    spare.push((set.into_scratch(), state));
                 }
             }
         }
@@ -6464,21 +6466,21 @@ impl HostList {
                     name(&budget, || "indirect budget of gathered records".to_owned());
                     gather.budget = Some(budget);
                 }
-                let scratch = match gather.spare.pop() {
-                    Some(scratch) => scratch,
+                let (scratch, before) = match gather.spare.pop() {
+                    Some(spare) => spare,
                     None => {
                         let Some(scratch) = host.uav_buffer(u64::from(crate::indirect::GATHER_MOST) * u64::from(crate::indirect::GATHER_STRIDE)) else {
                             return none(4);
                         };
                         name(&scratch, || "indirect arguments, gathered".to_owned());
-                        scratch
+                        (scratch, D3D12_RESOURCE_STATE_COMMON)
                     }
                 };
                 let Some(table) = self.scratch(u64::from(crate::indirect::GATHER_MOST) * 4) else {
-                    gather.spare.push(scratch);
+                    gather.spare.push((scratch, before));
                     return none(4);
                 };
-                gather.sets.push(crate::indirect::GatherSet::new(src.clone(), src_id, (kind, stride), scratch, table));
+                gather.sets.push(crate::indirect::GatherSet::new(src.clone(), src_id, (kind, stride), (scratch, before), table));
                 gather.sets.len() - 1
             }
         };
