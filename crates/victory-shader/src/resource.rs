@@ -1171,6 +1171,9 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.loaded(words) {
             return Ok(source);
         }
+        if let Some(source) = self.made_raw(words) {
+            return Ok(source);
+        }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
             let (mut hi, mut bits) = (hi, 0);
             while let Term::Value(v) = hi
@@ -2067,6 +2070,38 @@ impl<'a> Tracer<'a> {
     }
 
     /// Consecutive dwords of one scalar load.
+    /// A buffer descriptor loaded and made a raw one (as AMD's ACO compiler
+    /// does for byte address buffers): no stride, its bounds in bytes. The
+    /// host's view of the slot is of the bytes already.
+    fn made_raw(&self, words: &[Term]) -> Option<Source> {
+        let [first, stride, records, flags] = *words else {
+            return None;
+        };
+        // `x` with constant bits cleared or set.
+        let masked = |w: Term, op: &'static str| -> Option<(Term, u32)> {
+            let Term::Value(v) = w else { return None };
+            match self.sop2(v, &[op])? {
+                (_, [x, Term::Const(c)] | [Term::Const(c), x]) => Some((x, c)),
+                _ => None,
+            }
+        };
+        const STRIDE: u32 = 0x3fff_0000;
+        const BOUNDS: u32 = 0x3000_0000;
+        let (stride, kept) = masked(stride, "s_and_b32")?;
+        let (flags, set) = masked(flags, "s_or_b32")?;
+        let flags = masked(flags, "s_and_b32").map_or(flags, |(x, _)| x);
+        if kept != !STRIDE || set != BOUNDS {
+            return None;
+        }
+        let Term::Value(records) = records else {
+            return None;
+        };
+        let (_, [a, b]) = self.sop2(records, &["s_mul_i32"])?;
+        [a, b]
+            .into_iter()
+            .find_map(|records| self.loaded(&[first, stride, records, flags]))
+    }
+
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
             return None;

@@ -432,6 +432,145 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     Ok(out)
 }
 
+/// The native programs of a container: in its `DXIL` part, or the one of
+/// its `ACCC` part.
+pub fn container_programs(c: &crate::Container) -> Result<Vec<NativeProgram>, ShaderError> {
+    use crate::FourCC;
+    if let Some(part) = c.part(FourCC::DXIL) {
+        return native_programs(part.data);
+    }
+    match c.part(FourCC::ACCC) {
+        Some(part) => {
+            let root = c.part(FourCC::RTS0).map_or(&[][..], |p| p.data);
+            Ok(vec![accc_program(part.data, root)?])
+        }
+        None => Err(Malformed("no DXIL part")),
+    }
+}
+
+/// The compute program of an `ACCC` part (AMD's ACO compiler: Grand Theft
+/// Auto VI's upscaler passes), as observed:
+///
+/// ```text
+/// +0x00 "FSPX"  u32 version (1), u32 chunk count, u32 size, then per chunk:
+///               u32 kind, u32 offset, u32 size, u32 0
+/// kind 0        u32 x3, u16 x3 thread-group size, u16 flags (0x10 wave32),
+///               u32 COMPUTE_PGM_RSRC1, u32 COMPUTE_PGM_RSRC2
+/// kind 6        the code
+/// kind 7        u32 x6, then entries of u32 x8; those starting with 0x41
+///               hold a used resource as in `FSSM` (20 bytes) after it
+/// ```
+///
+/// The root signature's parameters arrive in user SGPRs from s4 on.
+fn accc_program(part: &[u8], root: &[u8]) -> Result<NativeProgram, ShaderError> {
+    /// `s0`-`s105`: the SGPRs a program can address (106 on is VCC).
+    const SGPRS: u32 = 106;
+    if part.get(0..4) != Some(b"FSPX") || u32_at(part, 4)? != 1 {
+        return Err(Malformed("an unknown ACCC part"));
+    }
+    let count = u32_at(part, 8)? as usize;
+    if count > MAX_XDAT_ENTRIES {
+        return Err(Malformed("implausible ACCC chunk count"));
+    }
+    let chunk = |kind: u32| -> Result<&[u8], ShaderError> {
+        for i in 0..count {
+            let at = 0x10 + 16 * i;
+            if u32_at(part, at)? == kind {
+                let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
+                return bytes(part, offset.into(), size.into())
+                    .ok_or(Malformed("ACCC chunk out of bounds"));
+            }
+        }
+        Err(Malformed("an ACCC chunk is missing"))
+    };
+    let head = chunk(0)?;
+    let (xy, z) = (u32_at(head, 12)?, u32_at(head, 16)?);
+    let wave64 = z >> 16 & 0x10 == 0;
+    let (rsrc1, rsrc2) = (u32_at(head, 20)?, u32_at(head, 24)?);
+    let vgprs = ((rsrc1 & 0x3f) + 1) * if wave64 { 4 } else { 8 };
+    if vgprs > 256 {
+        return Err(Malformed("implausible VGPR count"));
+    }
+    let used: Vec<UsedResource> = chunk(7)?
+        .get(24..)
+        .unwrap_or(&[])
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .take_while(|e| le32(&e[..], 0) == 0x41)
+        .map(|e| {
+            let e = &e[4..24];
+            let dwords = e[16];
+            UsedResource {
+                kind: match e[0] {
+                    0 => ResourceType::Srv,
+                    1 => ResourceType::Sampler,
+                    2 => ResourceType::Cbv,
+                    3 => ResourceType::Uav,
+                    n => ResourceType::Other(n),
+                },
+                root: RootType::from_raw(e[1].into()),
+                table_offset_dwords: le32(e, 4),
+                lower_bound: le32(e, 8),
+                // Not a stride here: 1 for raw buffers, 4 for textures.
+                stride: 0,
+                dwords,
+                user_data: e[17],
+                slot: e[18],
+            }
+        })
+        .collect();
+    // The serialized root signature's parameters (type, visibility, offset).
+    const FIRST: u32 = 4;
+    let mut layout = Vec::new();
+    let mut next = FIRST;
+    let params = if root.is_empty() { 0 } else { u32_at(root, 4)? };
+    if params > 64 {
+        return Err(Malformed("implausible root parameter count"));
+    }
+    for slot in 0..params as usize {
+        let at = u32_at(root, 8)? as usize + 12 * slot;
+        let sgprs = match u32_at(root, at)? {
+            0 => 1,
+            1 => u32_at(root, u32_at(root, at + 8)? as usize + 8)?,
+            _ => 2,
+        };
+        let user_data = u8::try_from(next).map_err(|_| Malformed("too many root constants"))?;
+        next += sgprs;
+        // As the code finds them: a table's entry per range it reads.
+        let read: Vec<&UsedResource> =
+            used.iter().filter(|u| u32::from(u.user_data) == u32::from(user_data)).collect();
+        let kind = match u32_at(root, at)? {
+            0 => RootType::Table,
+            1 => RootType::Constants,
+            _ => RootType::Descriptor,
+        };
+        layout.push(RootParam {
+            root: kind,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: read.first().map_or(0, |u| u.lower_bound),
+            user_data,
+            slot: slot as u8,
+        });
+    }
+    if next > u32::from(SGPRS) {
+        return Err(Malformed("root parameter outside the SGPRs"));
+    }
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: vgprs as u16,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2,
+            threads: [xy & 0xffff, xy >> 16, z & 0xffff],
+        }),
+        code: chunk(6)?.to_vec(),
+    })
+}
+
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
     if blob.get(0..4) != Some(b"XBCH") {
         return Err(Malformed("native blob lacks XBCH magic"));
