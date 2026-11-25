@@ -767,7 +767,10 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 }
 
 /// The maximal runs of nonzero bytes of `mask`, as (offset, length) in
-/// order: what a merge changed, and so the only bytes it writes back.
+/// order: what a merge changed. The tests measure the marks with it; the
+/// merges themselves write one stretch ([`write_merged`]), because a run
+/// each is a kernel call whatever its size.
+#[cfg(test)]
 fn mask_runs(mask: &[u8], runs: &mut Vec<(usize, usize)>) {
     runs.clear();
     let n = mask.len();
@@ -786,18 +789,50 @@ fn mask_runs(mask: &[u8], runs: &mut Vec<(usize, usize)>) {
     }
 }
 
-/// Writes only `runs` of `merged` to title memory at `address`: bytes the
-/// card did not change are never put back over a title write that landed
-/// since the read. Returns the bytes written.
-fn write_runs(address: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
-    let mut written = 0;
-    for &(off, len) in runs {
-        // A range of the stretch just read and merged; `write_mapped` leaves
-        // pages that are not mapped alone.
-        crate::host::write_mapped((address + off) as *mut u8, merged[off..off + len].as_ptr(), len);
-        written += len;
+/// Writes what the merge changed to title memory at `address`, leaving a
+/// title write that landed since the merge's read alone. Returns the bytes
+/// written.
+///
+/// One write of the whole stretch, not one per changed run: a run each is a
+/// kernel call whatever its size (about 2 ms in the title's big pools, see
+/// `crate::host::direct_writes`), and a frame's merges hold 18,000-20,000
+/// runs of a few hundred bytes — writing them one by one cost 750-1,010 ms a
+/// frame here (own6) against 190-250 ms before. So the bytes the card did
+/// not change are taken from title memory AS IT IS NOW, one read, and the
+/// whole stretch goes back in one write: a concurrent title write in an
+/// untouched byte is carried into what we write instead of being clobbered
+/// (upstream VIctory #2009, the race's #786 and #89).
+///
+/// `mask` marks the bytes the merge changed; `as_read` is title memory as
+/// the merge read it. A byte outside the mask that changed between that read
+/// and this one keeps its newer value. The window between this read and the
+/// write is one syscall wide, as the whole-stretch write always was; what
+/// this removes is the clobbering of every write in the gaps, which was the
+/// whole stretch's width.
+fn write_merged(
+    address: usize,
+    merged: &mut [u8],
+    mask: &[u8],
+    as_read: &[u8],
+    now: &mut Vec<u8>,
+) -> usize {
+    let n = merged.len().min(mask.len()).min(as_read.len());
+    if n == 0 {
+        return 0;
     }
-    written
+    now.clear();
+    now.resize(n, 0);
+    if crate::host::read_into(address as *const u8, now) {
+        // Untouched bytes take title memory as it is now: a write that landed
+        // since the merge's read is carried into the write below, not undone.
+        for i in 0..n {
+            if mask[i] == 0 {
+                merged[i] = now[i];
+            }
+        }
+    }
+    crate::host::write_mapped(address as *mut u8, merged.as_ptr(), n);
+    n
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1860,15 +1895,22 @@ mod merge_tests {
             }
         }
         // A title write that lands in an untouched byte of the gap after the
-        // merge's read: writing only the runs leaves it alone; writing the
-        // whole stretch, as the relay paths did, would have undone it.
-        let mut title_memory = title.clone();
+        // merge's read: `write_merged` takes the untouched bytes from title
+        // memory as it is now, so the one write carries that newer value
+        // instead of undoing it. Writing the stretch as it was read, which
+        // is what the relay paths did, clobbered it.
+        let mut now_memory = title.clone();
         let gap = n / 2;
-        title_memory[gap] = 0xee; // the title wrote here just now
-        for &(off, len) in &runs {
-            title_memory[off..off + len].copy_from_slice(&title[off..off + len]);
+        now_memory[gap] = 0xee; // the title wrote here just now
+        let mut merged = title.clone();
+        for i in 0..n {
+            if mask[i] == 0 {
+                merged[i] = now_memory[i];
+            }
         }
-        assert_eq!(title_memory[gap], 0xee, "the title's newer byte survived");
+        assert_eq!(merged[gap], 0xee, "the title's newer byte is carried");
+        assert_eq!(merged[12], title[12], "the card's byte still wins");
+        assert_ne!(title[gap], 0xee, "the stretch as read would have clobbered it");
     }
 
     /// A merge that changes nothing marks nothing, so nothing is written.
@@ -2699,19 +2741,17 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return 0;
         }
-        // The stretch as read: what the card did not change is the
-        // title's, and may have been written again since.
-        let as_read = merge_race_on().then(|| title.clone());
+        // The stretch as read: the bytes the card did not change are the
+        // title's, and may have been written again since (`write_merged`).
+        let as_read = title.clone();
         let mut mask = Vec::new();
         if !merge_masked(now, held, title, &mut mask) {
             return 0;
         }
-        // Only the bytes the card changed go back (`write_runs`).
-        let mut runs = Vec::new();
-        mask_runs(&mask, &mut runs);
         crate::watch::writing(start + at, n);
-        merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        write_runs(start + at, title, &runs)
+        merge_race(merge_race_on().then_some(&as_read[..]), (self.start, self.len), start + at, &title[..], "pc relay");
+        let mut fresh = Vec::new();
+        write_merged(start + at, title, &mask, &as_read, &mut fresh)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -3314,11 +3354,10 @@ impl Shadow {
         title.resize(n, 0);
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
-            // The stretch as read: what the card did not change is the
+            // The stretch as read: the bytes the card did not change are the
             // title's, and may have been written again since.
-            let as_read = merge_race_on().then(|| title.clone());
-            // As in `copy_back`, with the marks: only the changed bytes go
-            // back (`write_runs`).
+            let as_read = title.clone();
+            // As in `copy_back`, with the marks (`write_merged`).
             let mut mask = vec![0u8; n];
             let mut differs = 0u8;
             for (((t, g), o), m) in title.iter_mut().zip(gpu).zip(old.iter_mut()).zip(mask.iter_mut()) {
@@ -3330,11 +3369,10 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                let mut runs = Vec::new();
-                mask_runs(&mask, &mut runs);
                 crate::watch::writing(start + at, n);
-                merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
-                written = write_runs(start + at, title, &runs);
+                merge_race(merge_race_on().then_some(&as_read[..]), (self.start, self.len), start + at, &title[..], "card");
+                let mut fresh = Vec::new();
+                written = write_merged(start + at, title, &mask, &as_read, &mut fresh);
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -3397,9 +3435,9 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
-        // The stretch as read: what the card did not change is the
+        // The stretch as read: the bytes the merge leaves alone are the
         // title's, and may have been written again since.
-        let as_read = (mapped && merge_race_on()).then(|| title.clone());
+        let as_read = mapped.then(|| title.clone());
         let mut changed = false;
         let mut mask = vec![0u8; n];
         for (a, b) in outside(at, at + n, skip) {
@@ -3415,16 +3453,18 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        // Only the bytes the merge changed go back. The stretch written as a
-        // whole put the skipped ranges (title bytes still to go up, or sent
-        // with a later flight) back to what they held at the read, undoing
-        // the very writes `outside` had kept out of the merge (the race's
-        // #786 and #674 by AscilCH).
-        let mut runs = Vec::new();
-        mask_runs(&mask, &mut runs);
+        let Some(as_read) = as_read else {
+            return 0;
+        };
+        // The bytes the merge left alone - including the skipped ranges
+        // (title bytes still to go up, or sent with a later flight) - take
+        // title memory as it is now, so the write below carries those writes
+        // instead of undoing them, which is what writing the stretch as it
+        // was read did (the race's #786 and #674 by AscilCH).
         crate::watch::writing(start + at, n);
-        merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        write_runs(start + at, title, &runs)
+        merge_race(merge_race_on().then_some(&as_read[..]), (self.start, self.len), start + at, &title[..], "card relay");
+        let mut fresh = Vec::new();
+        write_merged(start + at, title, &mask, &as_read, &mut fresh)
     }
 }
 
