@@ -60,12 +60,52 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            if for_structures(&self.shaders) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        "passes that only feed or trace ray-tracing structures are left out while the builder is off (VICTORY_BVH_PASSES=1 makes them)"
+                    );
+                });
+                return None;
+            }
+            HostPipeline::new(&self.shaders, self.graphics.as_deref())
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// Whether some compute shader of `shaders` holds `name`.
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// Whether a shader only feeds the console's ray-tracing structures or
+/// traces rays through them, while the structure builder is off (so they
+/// are never built): the title's `bvh_skinning` passes
+/// (`CSComputeSkinning*`, every program of that name is one: they skin
+/// characters into the structures' vertex buffers) and the screen-probe
+/// ray tracers that walk them (`CS_ScreenProbes_TraceRays_*_BVH_*`; the
+/// `Fallback` and `Voxels` tracers stay). Ported from
+/// ZSlayerHQ/victory-world-runtime#7 (Jon Parkhill): on an RTX 5070 they
+/// took 89 ms of the card's 318 a world frame (skinning 37 and 20 ms, the
+/// tracer 32); without them the frame went from about 730 to 600-690 ms.
+/// In our own run the same tracer (`f22a76fcb967ee59`) took 20 ms of a
+/// frame. `VICTORY_BVH_PASSES=1` makes them as before; with
+/// `VICTORY_BVH_BUILDER=1` they are made.
+fn for_structures(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    let out = *OUT.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        std::env::var_os("VICTORY_BVH_PASSES").is_none_or(|v| v != "1") && !builder
+    });
+    out && (named(shaders, b"CSComputeSkinning")
+        || named(shaders, b"CS_ScreenProbes_TraceRays") && named(shaders, b"_BVH_"))
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -76,6 +116,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
+            if for_structures(&p.shaders) {
+                return Some("feeds or traces ray-tracing structures, which are not built; left out".into());
+            }
             let failed: Vec<String> = p
                 .shaders
                 .iter()
