@@ -237,7 +237,7 @@ struct Lower<'a> {
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
-    /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
+    /// it, and whether the host waves meet at its start and before its exit ([`super::lds::meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
@@ -338,7 +338,7 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+pub(super) fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
     for (_, region) in lane_regions(st)? {
@@ -827,16 +827,39 @@ fn meeting_mode() -> u32 {
 /// group barrier) at its start and before its exit. `None` if barriers cannot keep the
 /// console's order.
 ///
-/// The console runs the wave's lanes in step, so an LDS write is seen by every later read. Two
-/// host waves keep that order if they meet between any two accesses of which one writes. A
-/// barrier must be run by every thread, so it cannot stand in a lane branch's region; but
-/// every way into and out of such a region passes a block all lanes run, and the waves meet
-/// there: before the exit of an all-lane block into a region with LDS accesses, and at the
-/// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
-/// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
-/// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+/// The strict form delegates to [`super::lds::meetings`] (ported from
+/// vitutu1/victory-perf#12 by Vladimir-Human): a region's reads and writes
+/// are accepted only when byte intervals are proven disjoint, or every
+/// lane's addresses are private to it, under a group-uniform base - where
+/// the old form refused any region that both read and wrote.
+///
+/// `VICTORY_WAVE_LDS_LOOSE` (on by default, this fork's last resort for
+/// console wave64 programs) keeps the older approximate acceptance: two
+/// writes in one region are taken not to hit the same dword from both
+/// halves, and a read may see a stale value one half wrote. The strict
+/// proof runs first; the loose form is the fallback, so a program the
+/// proof refuses still translates as before.
+fn lds_meetings(
+    p: &crate::ir::Program,
+    st: &Structured,
+    io: &crate::io::Io,
+    res: &crate::resource::Resources,
+    cs: crate::native::ComputeIo,
+    all: &[bool],
+) -> Option<Vec<(bool, bool)>> {
+    if let Some(meet) = super::lds::meetings(p, st, io, res, cs, all) {
+        return Some(meet);
+    }
+    if !LDS_LOOSE.get() {
+        return None;
+    }
+    lds_meetings_loose(p, st, all)
+}
+
+/// The approximate acceptance ([`lds_meetings`], `VICTORY_WAVE_LDS_LOOSE`):
+/// regions joined without an all-lane block between them may both read and
+/// write; the waves meet at the region's entry and exit only.
+fn lds_meetings_loose(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -881,9 +904,6 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
                 writes[r] = true;
             }
         }
-    }
-    if (0..n).any(|r| reads[r] && writes[r]) && !LDS_LOOSE.get() {
-        return None;
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
@@ -1344,7 +1364,7 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, x.io, x.res, cs, &all) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -1398,7 +1418,7 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
+                            Some(all) if lds_meetings(p, x.st, x.io, x.res, cs, &all).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
                             }
                             Some(_) => {}
