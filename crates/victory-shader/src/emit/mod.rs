@@ -338,6 +338,72 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// The entry-point name the title's pipeline-state part gives its program
+/// (`CS_Visibility_7226f52c_Wrapped` and the like), or None: our own parts
+/// name no entry, and a truncated one is not trusted.
+fn entry_name(c: &Container) -> Option<String> {
+    let d = c.part(FourCC::PSV0)?.data;
+    let ri = crate::dxbc::u32_at(d, 0).ok()? as usize;
+    // Runtime info of version 2 or later (48 bytes at least); stage at 24.
+    if !(48..=4096).contains(&ri) || d.len() < 4 + ri {
+        return None;
+    }
+    let count = crate::dxbc::u32_at(d, 4 + ri).ok()? as usize;
+    if count > 4096 {
+        return None;
+    }
+    let at = 8 + ri;
+    let (stride, first) = if count == 0 {
+        (0usize, at)
+    } else {
+        let stride = crate::dxbc::u32_at(d, at).ok()? as usize;
+        if !(8..=256).contains(&stride) {
+            return None;
+        }
+        (stride, at + 4)
+    };
+    let strings = first.checked_add(count.checked_mul(stride)?)?;
+    let len = crate::dxbc::u32_at(d, strings).ok()? as usize;
+    let body = d.get(strings + 4..strings + 4 + len)?;
+    // The buffer starts with an empty string; the first name follows it.
+    let name = body.get(1..)?.split(|&b| b == 0).next()?;
+    if name.is_empty() || !name.iter().all(|&b| b.is_ascii_graphic()) {
+        return None;
+    }
+    std::str::from_utf8(name).ok().map(str::to_owned)
+}
+
+/// The wave-wide branch form tried for these programs without the global
+/// `VICTORY_WAVE_WIDE=1` (which lost the card in runs 121-124): the four
+/// that PR #823 measured coming out with 32-lane waves and taking the
+/// blocky band off the lower third of the screen — the water volumetrics'
+/// transmission pair, the particle visibility, and the tracing tiling.
+/// Each runs as thread groups of one console wave, so the form's barriers
+/// meet every thread ([`widen`] refuses the others).
+/// `VICTORY_WAVE_WIDE_ONLY` replaces the list (comma-separated name
+/// prefixes, matched so the hash suffix may differ; `none` for none).
+fn wave_wide_listed(name: Option<&str>) -> bool {
+    const NAMED: [&str; 4] = [
+        "CS_TransmissionVolumetrics_Tiled_",
+        "CS_TransmissionVolumetrics_Tiled_LocalLights_",
+        "CS_Visibility_",
+        "CS_Tiling_Generate_Opaque_",
+    ];
+    let Some(name) = name else {
+        return false;
+    };
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let extra = LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect())
+            .unwrap_or_default()
+    });
+    if !extra.is_empty() {
+        return extra.iter().any(|n| n != "none" && name.starts_with(n.as_str()));
+    }
+    NAMED.iter().any(|n| name.starts_with(n))
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -419,8 +485,11 @@ pub fn emit(
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // has no barrier, stays on. The water volumetrics' four named programs
+        // ([`wave_wide_listed`], PR #823) get the form on their own: their
+        // half-wave answers leave the water surface and its geometry wrong.
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+            || wave_wide_listed(entry_name(c).as_deref());
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -1035,6 +1104,50 @@ mod tests {
     fn a_backward_permute_reads_the_lane_its_address_names() {
         // v_mov_b32 v2, 11; ds_bpermute_b32 v1, v0, v2
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
+    }
+
+    /// The entry name of the title's PSV0 (runtime info 52, string buffer
+    /// after the resource records) is read; our own PSV0 (runtime info 48,
+    /// the buffer starts with the empty semantic string) gives none; a
+    /// truncated part is refused without reading past it.
+    #[test]
+    fn entry_names_come_from_the_titles_psv0_only() {
+        let mut psv = Vec::new();
+        psv.extend(52u32.to_le_bytes()); // runtime info size
+        psv.extend([0u8; 52]); // runtime info (stage at 24, unused here)
+        psv.extend(0u32.to_le_bytes()); // no resource records
+        let name = b"CS_Visibility_7226f52c_Wrapped";
+        let mut strings = vec![0u8];
+        strings.extend(name);
+        strings.push(0);
+        strings.resize(strings.len().next_multiple_of(4), 0);
+        psv.extend((strings.len() as u32).to_le_bytes());
+        psv.extend(&strings);
+        let container = crate::dxbc::build(&[(FourCC::PSV0, &psv)]);
+        let c = Container::parse(&container).unwrap();
+        assert_eq!(entry_name(&c).as_deref(), Some("CS_Visibility_7226f52c_Wrapped"));
+        assert!(wave_wide_listed(entry_name(&c).as_deref()));
+        assert!(wave_wide_listed(Some("CS_Tiling_Generate_Opaque_fe0149af_Wrapped")));
+        assert!(wave_wide_listed(Some("CS_TransmissionVolumetrics_Tiled_ff333313_Wrapped")));
+        assert!(wave_wide_listed(Some("CS_TransmissionVolumetrics_Tiled_LocalLights_ff333313_Wrapped")));
+        assert!(!wave_wide_listed(Some("ptfx_CS_lightAtlas_Sprite_0_Wrapped")));
+        assert!(!wave_wide_listed(None));
+        // Our own part: runtime info 48, an empty first string.
+        let mut ours = Vec::new();
+        ours.extend(48u32.to_le_bytes());
+        ours.extend([0u8; 48]);
+        ours.extend(0u32.to_le_bytes());
+        ours.extend(4u32.to_le_bytes());
+        ours.extend([0u8; 4]);
+        let container = crate::dxbc::build(&[(FourCC::PSV0, &ours)]);
+        let c = Container::parse(&container).unwrap();
+        assert_eq!(entry_name(&c), None);
+        // Truncations never panic and never name.
+        for len in 0..psv.len() {
+            let container = crate::dxbc::build(&[(FourCC::PSV0, &psv[..len])]);
+            let c = Container::parse(&container).unwrap();
+            let _ = entry_name(&c);
+        }
     }
 
     /// A carry-in reading a join of compares after a divergent branch. A
