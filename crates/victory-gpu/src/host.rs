@@ -742,6 +742,32 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// The kernel's read ([`super::read`], `NtReadVirtualMemory` with
+    /// `VICTORY_DIRECT_READS` on by default) copies committed memory and
+    /// refuses a page that is not readable, as `ReadProcessMemory` did.
+    #[test]
+    fn kernel_reads_copy_committed_pages_and_refuse_holes() {
+        use windows_sys::Win32::System::Memory::*;
+        const N: usize = 3 * 4096;
+        // SAFETY: a private reservation of ours; the middle page stays a
+        // hole; freed at the end.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            for offset in [0, 2 * 4096] {
+                let at = base.add(offset);
+                assert_eq!(VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                at.write_bytes(0x5a, 4096);
+            }
+            let mut out = vec![0u8; 4096];
+            assert!(super::read(base, out.as_mut_ptr(), 4096));
+            assert!(out.iter().all(|&v| v == 0x5a));
+            assert!(!super::read(base.add(4096), out.as_mut_ptr(), 4096), "a hole is not readable");
+            assert!(!super::read(base, out.as_mut_ptr(), N), "a range over a hole fails whole");
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -3572,12 +3598,19 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
+/// With [`crate::shadow::only_readback`], ranges the title never asked to
+/// read are left out: their copies keep the shader writes (every later draw
+/// reads the copy), and the scan and merge do not run for them.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
+    let filter = crate::shadow::only_readback();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let range = (*address, *address + *len);
+                if filter && !crate::shadow::readback_wanted(range.0, range.1) {
+                    continue;
+                }
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                     Some((_, ranges)) => {
                         if !ranges.contains(&range) {
@@ -4079,6 +4112,9 @@ impl Host {
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
+                    if crate::shadow::only_readback() && !crate::shadow::readback_wanted(range.0, range.1) {
+                        continue;
+                    }
                     match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
                         Some((_, ranges)) => {
                             if !ranges.contains(&range) {
@@ -6604,6 +6640,11 @@ impl HostList {
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
+        // The title asks for these bytes on its CPU: with
+        // `VICTORY_COPY_BACK_ONLY_READBACK` a shader-written range is handed
+        // back only where such an ask touches it.
+        let len = if rows > 0 { (rows - 1) * pitch + row } else { 0 };
+        crate::shadow::readback_note(dst as usize, len);
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
     }
 
@@ -6953,6 +6994,14 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
+                    // Only what the title asked to read goes back: no
+                    // snapshot either for a range left out (the compare
+                    // would have nothing to run on).
+                    if crate::shadow::only_readback()
+                        && !crate::shadow::readback_wanted(*address, address + len)
+                    {
+                        continue;
+                    }
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -7365,18 +7414,49 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// readable. With the kernel's own call (`NtReadVirtualMemory`,
+/// [`direct_reads`]) the Win32 wrapper's per-call overhead is skipped, as
+/// [`direct_writes`] does for `WriteProcessMemory` (victory-perf 4cb867b's
+/// recipe; that repository went dark, ported from the directive).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
+    if direct_reads() {
+        // SAFETY: the destination is mapped writable memory of `len` bytes;
+        // the kernel checks the source and reads nothing it cannot.
+        return unsafe {
+            NtReadVirtualMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) >= 0
+        };
+    }
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
+/// Whether title memory is read with the kernel's own call
+/// (`NtReadVirtualMemory`) and not `ReadProcessMemory`, whose Win32 wrapper
+/// adds a probe and structured-exception frame per call — thousands of
+/// calls a frame during copy-back. On by default; `VICTORY_DIRECT_READS=0`
+/// reads as before.
+fn direct_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_READS").is_none_or(|v| v != "0"))
+}
+
 #[link(name = "ntdll", kind = "raw-dylib")]
 unsafe extern "system" {
+    /// The kernel's read of a process's memory, `(process, address, bytes,
+    /// length, read out)`: an NTSTATUS, negative when a page of the range
+    /// is not there or not readable. As `ReadProcessMemory`, without the
+    /// Win32 wrapper.
+    fn NtReadVirtualMemory(
+        process: *mut std::ffi::c_void,
+        base: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
+    ) -> i32;
     /// The kernel's write into a process's memory, `(process, address,
     /// bytes, length, written out)`: an NTSTATUS, negative when a page of
     /// the range is not there or not writable. It changes no protection.

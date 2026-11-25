@@ -1410,6 +1410,61 @@ pub(crate) fn wide_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
+/// Whether copy-back carries only what the title asked to read
+/// (`VICTORY_COPY_BACK_ONLY_READBACK=1`; off by default — an experiment for
+/// the morning A/B).
+///
+/// The world declares dozens of overlapping views of its 174 MB heap as
+/// shader-writable; almost all of that is GPU scratch the title never reads
+/// on the CPU, yet every submission scans it and merges what differs
+/// (382 ms and 20 MB a frame in run own14_clean). With the switch, only
+/// copies whose bytes went to title memory through an explicit read-back
+/// (`HostList::defer_read_back`, the title's own copy commands) are handed
+/// back; the rest keep their shader writes in the host copy, where every
+/// later draw reads them. A title CPU read of a skipped buffer sees its own
+/// older bytes — that is what the morning run must check.
+pub(crate) fn only_readback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_BACK_ONLY_READBACK").is_some_and(|v| v == "1"))
+}
+
+/// Title-memory ranges the title has explicitly asked to read (its read-back
+/// copies, [`crate::host::HostList::defer_read_back`], and plain host copies
+/// into title memory). With [`only_readback`], a declared shader-write range
+/// is handed back only where it overlaps one of these. Bounded: the oldest
+/// are let go (a read-back asked long ago has landed long ago).
+static READBACK: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Notes `[at, at + len)` into `ranges` as explicitly read by the title;
+/// bounded, the oldest let go.
+fn readback_push(ranges: &mut Vec<(usize, usize)>, at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    if ranges.len() >= 4096 {
+        ranges.drain(..2048);
+    }
+    ranges.push((at, at.saturating_add(len)));
+}
+
+/// Notes `[at, at + len)` of title memory as explicitly read by the title.
+pub(crate) fn readback_note(at: usize, len: usize) {
+    if !only_readback() {
+        return;
+    }
+    readback_push(&mut READBACK.lock().unwrap_or_else(|e| e.into_inner()), at, len);
+}
+
+/// Whether `[from, to)` overlaps any of `ranges`.
+fn readback_overlaps(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
+    ranges.iter().any(|&(a, b)| a < to && from < b)
+}
+
+/// Whether `[from, to)` of title memory overlaps an explicit read-back.
+pub(crate) fn readback_wanted(from: usize, to: usize) -> bool {
+    readback_overlaps(&READBACK.lock().unwrap_or_else(|e| e.into_inner()), from, to)
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
@@ -2205,6 +2260,32 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    /// The read-back register: a declared range is wanted only where an
+    /// explicit ask overlaps it (touching ends do not overlap), and the
+    /// register stays bounded — the oldest asks are let go first.
+    #[test]
+    fn readback_register_answers_overlaps_and_stays_bounded() {
+        use super::{readback_overlaps, readback_push};
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        assert!(!readback_overlaps(&ranges, 0, 100), "nothing asked: nothing wanted");
+        readback_push(&mut ranges, 100, 50);
+        assert!(readback_overlaps(&ranges, 120, 130), "inside the ask");
+        assert!(readback_overlaps(&ranges, 90, 110), "straddling its start");
+        assert!(readback_overlaps(&ranges, 140, 200), "straddling its end");
+        assert!(readback_overlaps(&ranges, 0, 1000), "covering it");
+        assert!(!readback_overlaps(&ranges, 0, 100), "touching its start is not overlap");
+        assert!(!readback_overlaps(&ranges, 150, 200), "touching its end is not overlap");
+        readback_push(&mut ranges, 200, 0);
+        assert_eq!(ranges.len(), 1, "an empty ask notes nothing");
+        // Past the bound the oldest half goes; the newest ask stays.
+        for i in 0..5000 {
+            readback_push(&mut ranges, 1000 + i * 8, 8);
+        }
+        assert!(ranges.len() <= 4096, "{} asks kept", ranges.len());
+        assert!(readback_overlaps(&ranges, 1000 + 4999 * 8, 1000 + 5000 * 8), "the newest ask is kept");
+        assert!(!readback_overlaps(&ranges, 100, 150), "the oldest ask was let go");
     }
 }
 
