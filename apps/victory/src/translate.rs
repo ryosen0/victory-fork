@@ -11,7 +11,8 @@ use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
-    Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
+    Container, FourCC, HwStage, NativeProgram, ResourceType, RootType, ShaderError, ir,
+    native_programs,
 };
 use victory_shader::{io, resource};
 
@@ -74,6 +75,11 @@ struct Tally {
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
+    /// `VICTORY_USED_DUMP=1`: every tracked program's UAV table entries,
+    /// which is where a pass writing an image (the light resolves) is told
+    /// apart and its output found. Names come from the example line.
+    used_dump: bool,
+    uavs: Vec<String>,
 }
 
 impl Tally {
@@ -134,6 +140,7 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        self.uavs.extend(other.uavs);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
@@ -310,6 +317,7 @@ pub fn run(
                     s.spawn(|| {
                         let mut t = Tally {
                             list,
+                            used_dump: std::env::var_os("VICTORY_USED_DUMP").is_some(),
                             ..Tally::default()
                         };
                         let mut checks = Checks {
@@ -401,6 +409,11 @@ pub fn run(
     lines.sort();
     for l in lines {
         println!("{l}");
+    }
+    let mut uavs = t.uavs;
+    uavs.sort();
+    for l in uavs {
+        println!("used {l}");
     }
     let mut failed: Vec<_> = t.failed.into_iter().collect();
     failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
@@ -532,6 +545,25 @@ fn translate_programs(
                 let res = match resource::track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
+                        // `VICTORY_USED_DUMP=1`: where each program writes
+                        // images, so a pass of the title's own (a light
+                        // resolve) can be aimed at the right one on this
+                        // build instead of by another machine's offsets.
+                        if t.used_dump {
+                            let name = example();
+                            for u in p.used.iter().filter(|u| u.kind == ResourceType::Uav) {
+                                t.uavs.push(format!(
+                                    "{name} {:?} uav {:?} slot {} +{} dwords (u{}, {} dword(s), stride {})",
+                                    p.stage,
+                                    u.root,
+                                    u.slot,
+                                    u.table_offset_dwords,
+                                    u.lower_bound,
+                                    u.dwords,
+                                    u.stride,
+                                ));
+                            }
+                        }
                         Some(r)
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {

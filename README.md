@@ -1,10 +1,17 @@
-# VIctory fork (work in progress)
+# ryosen0/victory-fork — own/main (personal build)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
+A personal fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+files the user supplies. This is **not** an upstream-contributing fork: it is
+one owner's product branch, assembled from upstream `main` plus selected race
+fixes, and tuned for **one machine**:
+
+> Windows 11, AMD Ryzen 7 9800X3D, **NVIDIA RTX 3060 Ti 8 GB** (Ampere,
+> 32-lane waves), 32 GB RAM, driver 617.42. Series X profile.
+
+Every change lands in `own/main` only after an A/B run on that card proves a
+gain (or a fix) with no visual regression; dead flags are removed in the same
+cycle. One commit = one change = one measured result.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
@@ -16,17 +23,108 @@ developer or publisher.
   contributors is the base of everything here: the loader, the runtime
   services, the Direct3D 12 back end and the shader recompiler. Licensed
   GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
+  the commits that carry this fork's changes.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** —
+  the branch this fork tracks as `upstream`; most carried fixes below come
+  from its `main` and its open pull requests, credited per author.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
-  (GPL-2.0-only) was used as a reference for how the same title behaves under
-  another layer. Fixes inspired by it were written anew in VIctory's code.
-- The guard over every view of a memory page is code by **myokex**
-  ([victory-amd](https://github.com/myokex/victory-amd), commit `c6dc4d8`), which
-  adapts pull request #115 here by Spexivus, its correction by joroyt and a part of
-  VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
-  memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
-  are carried here unchanged apart from one merge conflict.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+  (GPL-2.0-only) was used as a reference only; code mixing happens in private
+  branches, never published.
+- Carried fixes (see `git log` for the exact commits): page-view guards by
+  **myokex** (victory-amd `c6dc4d8`, after #115 by Spexivus, correction by
+  joroyt, VIctory #1122 by tightfall); read-beside kernel reads by **Joshua
+  Odom** (`10ea38e`); NVIDIA wave32 host fixes **#799 by Massive-Adrian**;
+  meshdump tooling and low-address guards from the race forks. Resolution
+  levers (`VICTORY_RENDER_SCALE`, `VICTORY_OWN_UPSCALER`) carry code by
+  **ZigZagBoi1/ScarlettPort** (GPL-3.0-or-later), same byte checks and build pin.
+- This fork's changes were developed with AI coding assistance.
+
+## Status of own/main (2026-11-25)
+
+**World reached and stable; not playable yet: about 3-5 fps in the world,
+shadows black.** All numbers below are measured on the owner's RTX 3060 Ti
+with 25-minute instrumented runs (`tools/regress.ps1` in the owner's studio
+workspace), median over world frames.
+
+| Stage | State in own/main |
+|-------|-------------------|
+| Boot, menus, start screen | works, 30 fps |
+| Opening cutscene | plays in order, lit; ~6 fps |
+| Saves | autosave + load work (backed up before every test run) |
+| World | reached; renders characters, cars, city, sky; median 4.9-5.3 fps, 0 device removals, 0 int3 in the last four runs |
+| Light in shadow | missing: ray-traced bounce light and RT lamp/sun shadows do not run yet |
+| Frame anatomy (world) | ~290 ms = ~60 ms CPU prepare + ~216 ms GPU, of which **~190-207 ms is copy-back** (fetching shader-written pieces of card copies). Rendering itself is ~10-30 ms — copy-back is the bottleneck on this card |
+| Shader wall | 2 compute programs refused: one console wave of 64 lanes + LDS with divergent lane reads (`6f225b64…`, `5dc3b259…`); host max wave is 32. #799 fixed 4 of the 6 refusals the baseline had |
+| Stability | 0 device removals / TDR across own1-own5 (5 × 25 min); guards hold ~3.8 GB below 4 GiB |
+
+### A/B results on this card (what was tried, what stuck)
+
+| Change | Result | Verdict |
+|--------|--------|---------|
+| #799 NVIDIA wave32 host fixes | 4 of 6 refused compute pipelines now created; translate errors 1→0 | **in own/main** |
+| #220 indirect window (`VICTORY_INDIRECT_WINDOW=1`) | median 4.8 vs 4.9 baseline — no gain here (our frame is copy-back-bound, not clamp-bound); 7/900k window-check mismatches | experimental branch `own/exp-indirect`, **not merged** |
+| `VICTORY_RENDER_SCALE=0.5` + own upscaler | median 3.3; world GPU time outside copy-back is only ~9 ms — nothing to cut; upscale visually clean | lever kept, **off** for this card |
+| `VICTORY_CARD_FETCH_INFLIGHT=1` (#648 mechanism) | fetch wait 190→54 ms, landing 216→90 ms (mechanism works); fps gain unproven — the run landed in a heavier scene | off pending a fair re-test |
+| relay=2 / LATE_WAIT=3 / WIDE_BACK / card buffers ≥1 MB | already the defaults of this tree (inherited from upstream main) | on |
+
+Known visual defects being worked: black character skin, a few floating
+black quads (likely the two refused wave64 compute programs), black ground
+and shadows (RT not running).
+
+### Branches
+
+- `own/main` — the product branch; only A/B-proven changes.
+- `own/exp-indirect` — #220 port (6 commits), kept for reference; measured
+  no gain on this card.
+- `good/<date>` tags — regression-passed snapshots.
+
+## Getting started (this fork)
+
+Requirements: Windows 10/11 x64, AVX2 CPU, D3D12 GPU with shader model 6.6
+and mesh shaders, Rust (pinned in `rust-toolchain.toml`). Several GiB of
+Windows commit must be free at startup (error 1455 in `crashes.log` = raise
+the paging file).
+
+```powershell
+cargo xtask install-hooks                # asset-policy check on every commit
+copy victory.example.toml victory.toml   # set game_dir/cache/data OUTSIDE the repo
+cargo test --workspace                   # needs no game data
+cargo run -p victory -- config           # check your paths
+cargo build --release -p victory
+target\release\victory.exe run <game dir>\<the title's exe> --execute
+```
+
+Diagnostics build (frame captures, GPU timing, shader dumps):
+
+```powershell
+cargo build --profile diag -p victory --features diagnostics
+```
+
+Offline shader repro without running the game (used for the wave64 wall):
+
+```powershell
+$env:VICTORY_HOST_WAVE='32'; $env:VICTORY_WAVE_WHY='1'
+target\diag\victory.exe translate <file.compute.cdxil> --validate --pipelines --list
+```
+
+Input: XInput pads; with none connected the keyboard is a pad while the
+window has focus (WASD/IJKL sticks, Enter=A, Esc=Menu, Tab=View, arrows
+D-pad, Q/E shoulders, Z/C triggers, F/H stick clicks).
+
+Environment switches: see the table in the upstream README below; every
+switch is also documented in a comment where it is read. The ones this fork
+added: `VICTORY_RENDER_SCALE` (0.2..1.0, pins the title's internal render
+scale), `VICTORY_OWN_UPSCALER=1` (force the title's own temporal upscaler on
+every console profile).
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+---
+
+Everything below this line is upstream VIctory's own README, unchanged; its
+status section describes upstream, not this fork.
 
 ## Status of this fork (2026-11-25)
 

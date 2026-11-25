@@ -737,16 +737,67 @@ impl Flights {
 /// later flight at this moment, and a store there, even of the value just
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
-fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+/// `mask` takes one byte per byte of the stretch: nonzero where the merge
+/// changed title memory, 0 where it left the title's byte. Only those bytes
+/// may be written back, so a title write that lands in an untouched byte
+/// between the read and the write survives (upstream VIctory #2009; the same
+/// fix in the race's #786 by AscilCH — `back_piece` already did this while
+/// the three relay paths wrote the whole stretch, which showed as missing
+/// character skin with the relay on, the race's #89).
+fn merge_masked(now: &[u8], held: &mut [u8], title: &mut [u8], mask: &mut Vec<u8>) -> bool {
+    mask.clear();
+    mask.resize(title.len(), 0);
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+    for (((n, h), t), m) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()).zip(mask.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
         let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
+        *m = merged ^ *t;
+        differs |= *m;
         *t = merged;
         *h = (*h & !wrote) | (*n & wrote);
     }
     differs != 0
+}
+
+/// [`merge_masked`] without the marks: whether the merge changed title
+/// memory. The tests use it; the merges themselves need the marks.
+#[cfg(test)]
+fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    merge_masked(now, held, title, &mut Vec::new())
+}
+
+/// The maximal runs of nonzero bytes of `mask`, as (offset, length) in
+/// order: what a merge changed, and so the only bytes it writes back.
+fn mask_runs(mask: &[u8], runs: &mut Vec<(usize, usize)>) {
+    runs.clear();
+    let n = mask.len();
+    let mut i = 0;
+    while i < n {
+        while i < n && mask[i] == 0 {
+            i += 1;
+        }
+        let first = i;
+        while i < n && mask[i] != 0 {
+            i += 1;
+        }
+        if i > first {
+            runs.push((first, i - first));
+        }
+    }
+}
+
+/// Writes only `runs` of `merged` to title memory at `address`: bytes the
+/// card did not change are never put back over a title write that landed
+/// since the read. Returns the bytes written.
+fn write_runs(address: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
+    let mut written = 0;
+    for &(off, len) in runs {
+        // A range of the stretch just read and merged; `write_mapped` leaves
+        // pages that are not mapped alone.
+        crate::host::write_mapped((address + off) as *mut u8, merged[off..off + len].as_ptr(), len);
+        written += len;
+    }
+    written
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1776,7 +1827,80 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_runs};
+    use super::{PIECE, back_piece, changed_runs, mask_runs, merge_masked};
+
+    /// The relay merges mark exactly the bytes they changed, and the runs of
+    /// those marks are the only bytes a write-back may touch: a byte the
+    /// card did not change is never written, so a title write that landed
+    /// there between the merge's read and its write survives (upstream
+    /// VIctory #2009; the race's #786, whose measurement of missing
+    /// character skin with the relay on is #89).
+    #[test]
+    fn relay_merges_mark_only_changed_bytes() {
+        // A 64 KiB stretch the card wrote two words of, far apart.
+        let n = PIECE;
+        let held: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let mut now = held.clone();
+        for at in [12usize, n - 40] {
+            now[at] ^= 0x5a;
+            now[at + 1] ^= 0xa5;
+        }
+        let mut snapshot = held.clone();
+        let mut title = held.clone();
+        let mut mask = Vec::new();
+        assert!(merge_masked(&now, &mut snapshot, &mut title, &mut mask));
+        let mut runs = Vec::new();
+        mask_runs(&mask, &mut runs);
+        // Two runs of two bytes, not the whole stretch between them.
+        assert_eq!(runs, [(12, 2), (n - 40, 2)]);
+        // Every byte outside the runs keeps the title's value.
+        for (i, &m) in mask.iter().enumerate() {
+            if m == 0 {
+                assert_eq!(title[i], held[i], "byte {i} was not the card's to write");
+            }
+        }
+        // A title write that lands in an untouched byte of the gap after the
+        // merge's read: writing only the runs leaves it alone; writing the
+        // whole stretch, as the relay paths did, would have undone it.
+        let mut title_memory = title.clone();
+        let gap = n / 2;
+        title_memory[gap] = 0xee; // the title wrote here just now
+        for &(off, len) in &runs {
+            title_memory[off..off + len].copy_from_slice(&title[off..off + len]);
+        }
+        assert_eq!(title_memory[gap], 0xee, "the title's newer byte survived");
+    }
+
+    /// A merge that changes nothing marks nothing, so nothing is written.
+    #[test]
+    fn an_unchanging_merge_writes_nothing() {
+        let held: Vec<u8> = (0..512).map(|i| (i % 97) as u8).collect();
+        let now = held.clone();
+        let mut title = held.clone();
+        let mut snapshot = held.clone();
+        let mut mask = Vec::new();
+        assert!(!merge_masked(&now, &mut snapshot, &mut title, &mut mask));
+        assert!(mask.iter().all(|&m| m == 0));
+        let mut runs = Vec::new();
+        mask_runs(&mask, &mut runs);
+        assert!(runs.is_empty());
+        assert_eq!(title, held);
+    }
+
+    /// Runs are maximal: adjacent changed bytes form one run, and a single
+    /// unchanged byte splits them.
+    #[test]
+    fn mask_runs_are_maximal() {
+        let mut runs = Vec::new();
+        mask_runs(&[0, 1, 1, 0, 1, 0, 0, 1, 1, 1], &mut runs);
+        assert_eq!(runs, [(1, 2), (4, 1), (7, 3)]);
+        mask_runs(&[], &mut runs);
+        assert!(runs.is_empty());
+        mask_runs(&[0, 0, 0], &mut runs);
+        assert!(runs.is_empty());
+        mask_runs(&[1, 1], &mut runs);
+        assert_eq!(runs, [(0, 2)]);
+    }
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -2578,13 +2702,16 @@ impl Shadow {
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
         let as_read = merge_race_on().then(|| title.clone());
-        if !merge_piece(now, held, title) {
+        let mut mask = Vec::new();
+        if !merge_masked(now, held, title, &mut mask) {
             return 0;
         }
+        // Only the bytes the card changed go back (`write_runs`).
+        let mut runs = Vec::new();
+        mask_runs(&mask, &mut runs);
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        write_runs(start + at, title, &runs)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -3190,21 +3317,24 @@ impl Shadow {
             // The stretch as read: what the card did not change is the
             // title's, and may have been written again since.
             let as_read = merge_race_on().then(|| title.clone());
-            // As in `copy_back`: the card's byte where it is not what it
-            // was before the submission, else the title's.
+            // As in `copy_back`, with the marks: only the changed bytes go
+            // back (`write_runs`).
+            let mut mask = vec![0u8; n];
             let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+            for (((t, g), o), m) in title.iter_mut().zip(gpu).zip(old.iter_mut()).zip(mask.iter_mut()) {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
                 let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
+                *m = merged ^ *t;
+                differs |= *m;
                 *t = merged;
                 *o = merged;
             }
             if differs != 0 {
+                let mut runs = Vec::new();
+                mask_runs(&mask, &mut runs);
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                written = n;
+                written = write_runs(start + at, title, &runs);
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -3271,19 +3401,30 @@ impl Shadow {
         // title's, and may have been written again since.
         let as_read = (mapped && merge_race_on()).then(|| title.clone());
         let mut changed = false;
+        let mut mask = vec![0u8; n];
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            let mut piece = Vec::new();
+            if merge_masked(&gpu[a..b], &mut held[a..b], &mut title[a..b], &mut piece) {
+                changed = true;
+                mask[a..b].copy_from_slice(&piece);
+            }
         }
         if !mapped || !changed {
             return 0;
         }
+        // Only the bytes the merge changed go back. The stretch written as a
+        // whole put the skipped ranges (title bytes still to go up, or sent
+        // with a later flight) back to what they held at the read, undoing
+        // the very writes `outside` had kept out of the merge (the race's
+        // #786 and #674 by AscilCH).
+        let mut runs = Vec::new();
+        mask_runs(&mask, &mut runs);
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        write_runs(start + at, title, &runs)
     }
 }
 
