@@ -3234,6 +3234,11 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            Operand::Const(253) => {
+                // SCC read as data: one bit, zero-extended.
+                let bit = self.scc_in(inst)?;
+                Ok(self.s.m.cast(self.cur, Cast::ZExt, bit, self.s.t.i32))
+            }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -3642,13 +3647,18 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
-            Atom::Uniform(v) => match self.get(v)? {
-                Val::Bit(x) => Ok(x),
-                Val::I32(x) => {
+            Atom::Uniform(v) => match self.get(v) {
+                Ok(Val::Bit(x)) => Ok(x),
+                Ok(Val::I32(x)) => {
                     let z = self.s.m.i32(0);
                     Ok(self.s.m.cmp(at, pred::NE, x, z))
                 }
-                Val::Missing(w) => Err(w),
+                Ok(Val::Missing(w)) => Err(w),
+                // SCC of a mask operation read as a uniform condition (a
+                // scalar loop test joined with it): "some lane's bit is set",
+                // asked where the operation stands (scc_some).
+                Err(_) if self.x.st.scc_some.contains_key(&v) => self.scc_some(v),
+                Err(w) => Err(w),
             },
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
@@ -11420,6 +11430,11 @@ impl<'a> Lower<'a> {
                             && self.mask_data == MaskData::Console
                             && st.scc_some.contains_key(&arg) =>
                     {
+                        // A wave-wide branch needs no widening: every lane
+                        // takes it together by construction. So does a lane
+                        // branch whose condition is uniform (a scalar loop
+                        // test): all lanes evaluate the same SCC. Only a
+                        // per-lane condition needs the region widened.
                         let per_lane = !st.wide.contains(&q)
                             && matches!(st.exits[q], LaneExit::Branch { when, .. }
                                 if !st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))));
