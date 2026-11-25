@@ -538,10 +538,8 @@ fn accc_program(part: &[u8], root: &[u8]) -> Result<NativeProgram, ShaderError> 
         let user_data = u8::try_from(next).map_err(|_| Malformed("too many root constants"))?;
         next += sgprs;
         // As the code finds them: a table's entry per range it reads.
-        let read: Vec<&UsedResource> = used
-            .iter()
-            .filter(|u| u32::from(u.user_data) == u32::from(user_data))
-            .collect();
+        let read: Vec<&UsedResource> =
+            used.iter().filter(|u| u32::from(u.user_data) == u32::from(user_data)).collect();
         let kind = match u32_at(root, at)? {
             0 => RootType::Table,
             1 => RootType::Constants,
