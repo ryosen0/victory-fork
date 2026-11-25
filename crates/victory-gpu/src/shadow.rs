@@ -1847,6 +1847,46 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
+/// one run, the gap's bytes included.
+fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    if gap == 0 || runs.len() < 2 {
+        return runs;
+    }
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (at, n) in runs {
+        match out.last_mut() {
+            Some(last) if at - (last.0 + last.1) <= gap => last.1 = at + n - last.0,
+            _ => out.push((at, n)),
+        }
+    }
+    out
+}
+
+/// The gap, in bytes, over which the title bytes put into a copy in the
+/// card's memory under flights' shader writes are joined into one run
+/// (`VICTORY_MERGE_GAP`, 0 to 64; 0 by default: only the bytes the title
+/// changed go up, as before).
+///
+/// Run 219: the title rewrites some hundred pages of its big buffer a
+/// frame while flights that may write that buffer are in the air, and
+/// byte by byte the new content differs from the old in 38,000 runs a
+/// frame (equal bytes in between, mostly zeros), far over the 512 runs a
+/// submission may send, so the flights were settled twice a frame, 50 ms
+/// of the submitting thread. Joined over small gaps the same pages are a
+/// few runs.
+///
+/// What it gives up: a gap byte is equal in title memory and on the CPU
+/// side of the copy, and goes up with its run. If a flight in the air
+/// wrote exactly that byte on the card (a shader store within `gap` bytes
+/// between two bytes the title changed in the same frame), the store is
+/// overwritten with the old value, and no compare finds it. Exact (0) is
+/// the default for that reason.
+fn merge_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| std::env::var("VICTORY_MERGE_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(0, |n| n.min(64)))
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -2665,6 +2705,7 @@ impl Shadow {
                     continue;
                 };
                 let at = at + first;
+                crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
                 crate::watch::writing(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
@@ -2762,10 +2803,99 @@ impl Shadow {
         if !merge_masked(now, held, title, &mut mask) {
             return 0;
         }
+        crate::host::shaders_write(start + at, &title[..]);
+        if self.put_back_own(start + at, &title[..]) {
+            return n;
+        }
         crate::watch::writing(start + at, n);
         merge_race(merge_race_on().then_some(as_read.as_deref()).flatten(), (self.start, self.len), start + at, &title[..], "pc relay");
         let mut fresh = Vec::new();
         write_merged(start + at, title, &mask, merge_carry_on().then_some(as_read.as_deref()).flatten(), &mut fresh)
+    }
+
+    /// With `crate::inplace::back_own` (`VICTORY_BACK_OWN_VIEW=1`): stores
+    /// what a merge made of title memory `[at, at + bytes.len())` (inside
+    /// one 64 KiB page, as every merged stretch is) through a view of our
+    /// own, tells the journal, and notes the page current for this copy if
+    /// it was current before: the copy holds the same bytes (the merge put
+    /// them into both), so the next refresh need not take the page again.
+    /// The guards are not touched: a title write to the page still faults
+    /// and is reported at a later asking, which every copy then takes,
+    /// this one too. False with nothing done if the switch is off or the
+    /// memory cannot be written that way (the caller writes as before).
+    fn put_back_own(&self, at: usize, bytes: &[u8]) -> bool {
+        /// Since the start: stretches and bytes stored this way, pages
+        /// noted current for their copy, stretches written the old way;
+        /// and with `VICTORY_BACK_OWN_CHECK=1`: stores the title's own
+        /// address did not show afterwards, pages noted current whose
+        /// CPU side in the copy differs from title memory, and those of
+        /// them whose guard was clean (a hole in the rule: a title write
+        /// on its way leaves the guard open).
+        static OWN_WRITES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+        static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let check = *CHECK.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_CHECK").is_some_and(|v| v == "1"));
+        if !crate::inplace::back_own() {
+            return false;
+        }
+        let Some(shown) = crate::inplace::write_own(at, bytes) else {
+            OWN_WRITES[3].fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        if check {
+            // The title's own address must show what went in through ours.
+            let mut back = vec![0u8; bytes.len()];
+            if crate::host::read_into(at as *const u8, &mut back) && back != bytes {
+                OWN_WRITES[4].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let page = at / PAGE;
+        let others: Vec<usize> = shown.iter().map(|&a| a / PAGE).filter(|&p| p != page).collect();
+        let (before, now) = crate::watch::wrote_own(page, &others);
+        // A placed texture there changed with no descriptor written (what
+        // `crate::watch::writing` tells the texture table on the old way).
+        crate::descriptor::host::remapped(at, bytes.len());
+        let base = self.start as usize / PAGE;
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
+                && *taken != 0
+                && *taken >= before
+            {
+                *taken = (*taken).max(now);
+                OWN_WRITES[2].fetch_add(1, Ordering::Relaxed);
+                // A copy in the card's memory only: its CPU side is never
+                // written by the card, so it must equal title memory now.
+                if check && self.card.is_some() {
+                    let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                    let (lo, hi) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+                    if lo < hi {
+                        let mut title = vec![0u8; hi - lo];
+                        // SAFETY: inside the copy's mapping; read only.
+                        let held = unsafe { std::slice::from_raw_parts(self.data.add(lo - start).cast_const(), hi - lo) };
+                        if crate::host::read_into(lo as *const u8, &mut title) && title != held {
+                            OWN_WRITES[5].fetch_add(1, Ordering::Relaxed);
+                            if crate::watch::clean(page) {
+                                OWN_WRITES[6].fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        OWN_WRITES[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let n = OWN_WRITES[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 16384 == 0 {
+            tracing::info!(
+                "what shaders wrote, stored through views of our own (VICTORY_BACK_OWN_VIEW=1), since the start: {n} stretches {} MB, {} pages noted current for the copy that wrote them (not copied in again), {} stretches written the old way; with VICTORY_BACK_OWN_CHECK=1: {} stores the title's address did not show, {} pages noted current whose CPU side differs from title memory, {} of those with the guard clean",
+                OWN_WRITES[1].load(Ordering::Relaxed) >> 20,
+                OWN_WRITES[2].load(Ordering::Relaxed),
+                OWN_WRITES[3].load(Ordering::Relaxed),
+                OWN_WRITES[4].load(Ordering::Relaxed),
+                OWN_WRITES[5].load(Ordering::Relaxed),
+                OWN_WRITES[6].load(Ordering::Relaxed)
+            );
+        }
+        true
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -3017,7 +3147,7 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
+                    let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
                         return true;
                     }
@@ -3382,6 +3512,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
+                crate::host::shaders_write(start + at, &title[..]);
                 crate::watch::writing(start + at, n);
                 merge_race(merge_race_on().then_some(as_read.as_deref()).flatten(), (self.start, self.len), start + at, &title[..], "card");
                 let mut fresh = Vec::new();
@@ -3464,6 +3595,12 @@ impl Shadow {
         }
         if !mapped || !changed {
             return 0;
+        }
+        // Upstream's own view of the copy takes the write when it can
+        // (`put_back_own`); the layer's write-back below is the fallback.
+        crate::host::shaders_write(start + at, &title[..]);
+        if self.put_back_own(start + at, &title[..]) {
+            return n;
         }
         // With the carry on, the bytes the merge left alone - including the
         // skipped ranges (title bytes still to go up, or sent with a later
