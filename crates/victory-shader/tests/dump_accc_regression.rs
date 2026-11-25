@@ -7,18 +7,25 @@
 //! lane mask still returns `Unsupported`); a graceful `Err` is fine, a panic
 //! or a malformed-structure error is not.
 //!
-//! The fixture is a copy of a title shader kept with the test so the suite
-//! stays offline and path-independent (the old dump_accc.rs read the corpus
-//! by absolute path and was removed for that reason).
+//! Nothing from the game may live in this repository (docs/asset-policy.md),
+//! so the blob is read from outside it: `VICTORY_ACCC_FIXTURE` names the
+//! file, and the test skips when the variable is unset (the policy's rule
+//! for tests that need real files).
 
 use victory_shader::{Container, FourCC, ShaderError, container_programs};
 
-const BLOB: &[u8] = include_bytes!("data/8e614708143ef917.compute.cdxil");
-
 #[test]
 fn dump_accc_regression() {
+    let Ok(path) = std::env::var("VICTORY_ACCC_FIXTURE") else {
+        eprintln!("VICTORY_ACCC_FIXTURE unset: skipping the ACCC fixture test");
+        return;
+    };
+    let Ok(blob) = std::fs::read(&path) else {
+        eprintln!("cannot read {path}: skipping the ACCC fixture test");
+        return;
+    };
     // 1. The DXBC wrapper parses and carries an ACCC part, not DXIL.
-    let c = Container::parse(BLOB).expect("the container parses");
+    let c = Container::parse(&blob).expect("the container parses");
     assert!(c.part(FourCC::DXIL).is_none(), "ACO code, no DXIL part");
     let accc = c.part(FourCC::ACCC).expect("an ACCC part").data;
     assert_eq!(&accc[..4], b"FSPX");
@@ -40,7 +47,7 @@ fn dump_accc_regression() {
     // 4. Full translation may still refuse the scalar-lane-mask loop, but it
     //    must do so as a typed Unsupported/Isa error, never a panic and never
     //    a structural Malformed/NotDxbc (that would mean the ACCC port broke).
-    if let Err(e) = victory_shader::emit::translate(BLOB) {
+    if let Err(e) = victory_shader::emit::translate(&blob) {
         assert!(
             matches!(e, ShaderError::Unsupported { .. } | ShaderError::Isa { .. }),
             "unexpected error kind for the ACO upscaler: {e}"

@@ -76,3 +76,7 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# real-title test fixtures live outside the repository (docs/asset-policy.md)
+crates/victory-shader/tests/data/
+
