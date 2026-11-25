@@ -158,10 +158,18 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // What the records charge, from `before` on, in lane order: a
         // record that does not fit whole runs empty and takes the rest.
         // Only the group's own records are walked (one, clamped alone).
+        //
+        // The charge is one compare-and-swap of the whole group's sum, and
+        // it is repeated until it lands or the budget is full: leaving the
+        // loop on a failed swap charged this group against a value another
+        // group had already replaced, so its records were told they fitted
+        // in room that was spent (the warp budget test kept records 1, 2 and
+        // 64 of a budget that holds two).
         uint before;
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
-        while (before < BUDGET) {
+        for (;;) {
+            if (before >= BUDGET) break;
             uint next = before;
             for (uint j = 0; j < n; j++) {
                 uint c = costs[j];
@@ -169,10 +177,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                     next = (BUDGET - next <= c) ? BUDGET : (next + c);
                 }
             }
+            // Nothing of this group charges (every record empty or already
+            // past the budget): the budget stands as it is.
             if (next == before) break;
             uint prev;
             budget.InterlockedCompareExchange(0, before, next, prev);
             if (prev == before) break;
+            // Another group charged first: walk this group's records again
+            // from what the budget holds now.
             before = prev;
         }
         uint at = before;
