@@ -18,8 +18,8 @@ use crate::gfx10::{Fields, NULL, Operand};
 use crate::io::{Input, Io};
 use crate::ir::{Block, EXEC, Inst, PARKED, Program, Reg, Value, idoms, reverse_postorder};
 use crate::native::ComputeIo;
-use crate::resource::{Resources, inline};
-use crate::structure::{LaneExit, Structured};
+use crate::resource::{Address, CODE, MEMORY, Resources, inline};
+use crate::structure::{Atom, LaneExit, Structured};
 
 /// Upper bound (1 MiB) on symbolic byte offsets and per-group lane footprints so 32-bit
 /// address addition cannot wrap modulo 2^32.
@@ -132,6 +132,35 @@ pub(super) fn meetings(
         }
     }
 
+    let mut region_has_cycle = vec![false; n];
+    // Detect internal cycles strictly within `!all` blocks (`!all[b] && !all[t]`).
+    let mut color = vec![0u8; n];
+    for start in 0..n {
+        if all[start] || color[start] != 0 {
+            continue;
+        }
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        color[start] = 1;
+        while let Some((u, idx)) = stack.pop() {
+            let nexts = succ(u);
+            if idx < nexts.len() {
+                stack.push((u, idx + 1));
+                let t = nexts[idx];
+                if !all[t] {
+                    if color[t] == 1 {
+                        let r = find(&mut region, u);
+                        region_has_cycle[r] = true;
+                    } else if color[t] == 0 {
+                        color[t] = 1;
+                        stack.push((t, 0));
+                    }
+                }
+            } else {
+                color[u] = 2;
+            }
+        }
+    }
+
     let ctx = AddrCtx::new(p, st, io, res, cs, all);
     let mut region_accesses: Vec<Vec<Access>> = vec![Vec::new(); n];
     let mut reads = vec![false; n];
@@ -196,13 +225,26 @@ pub(super) fn meetings(
             return None;
         }
         if reads[r] && writes[r] {
-            let safe = region_disjoint_ranges(&region_accesses[r])
-                || region_lane_private(&region_accesses[r], cs.threads);
+            // Cyclic `!all` regions lack an in-loop barrier, so Refinement A cannot prevent
+            // cross-iteration RAW/WAR/WAW between host halves; only lane-private slots are safe.
+            let disjoint_ok = !region_has_cycle[r] && region_disjoint_ranges(&region_accesses[r]);
+            let safe = disjoint_ok || region_lane_private(&region_accesses[r], cs.threads);
             if !safe {
                 return None;
             }
-        } else if writes[r] && !has_rmw[r] && has_provable_shared_waw(&region_accesses[r]) {
-            return None;
+        } else if writes[r] && !has_rmw[r] {
+            if has_provable_shared_waw(&region_accesses[r]) {
+                return None;
+            }
+            if region_has_cycle[r]
+                && region_accesses[r].iter().any(|a| {
+                    a.expr
+                        .as_ref()
+                        .is_some_and(|e| e.tid == [0, 0, 0] && e.console_lane == 0)
+                })
+            {
+                return None;
+            }
         }
     }
 
@@ -694,6 +736,8 @@ struct AddrCtx<'a> {
     def_inst: HashMap<Value, (usize, usize)>,
     def_phi: HashMap<Value, (usize, usize)>,
     waterfall_loads: HashSet<(usize, usize)>,
+    scalar: HashMap<(usize, usize), Address>,
+    writes_memory: bool,
     reg_inputs: HashMap<Value, InputKind>,
 }
 
@@ -727,6 +771,18 @@ impl<'a> AddrCtx<'a> {
             }
         }
 
+        let writes_memory = p.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+            let n = inst.name();
+            match inst.fields {
+                Fields::Buffer { .. } | Fields::Image { .. } => {
+                    n.contains("store") || n.contains("atomic")
+                }
+                Fields::Flat { .. } => !n.starts_with("global_load_"),
+                Fields::Smem { .. } => n.contains("store") || n.contains("atomic"),
+                _ => false,
+            }
+        });
+
         let io_map: HashMap<Value, Input> = io.inputs.iter().copied().collect();
         let mut reg_inputs = HashMap::new();
         for &(reg, val) in &p.inputs {
@@ -743,7 +799,17 @@ impl<'a> AddrCtx<'a> {
         }
 
         let waterfall_loads: HashSet<(usize, usize)> = res.waterfall.loads.iter().copied().collect();
-        let uniform_cfg = compute_uniform_cfg(p, st, all, &def_inst, &reg_inputs, &waterfall_loads);
+        let scalar: HashMap<(usize, usize), Address> = res.scalar.iter().copied().collect();
+        let uniform_cfg = compute_uniform_cfg(
+            p,
+            st,
+            all,
+            &def_inst,
+            &reg_inputs,
+            &waterfall_loads,
+            &scalar,
+            writes_memory,
+        );
 
         Self {
             p,
@@ -755,6 +821,8 @@ impl<'a> AddrCtx<'a> {
             def_inst,
             def_phi,
             waterfall_loads,
+            scalar,
+            writes_memory,
             reg_inputs,
         }
     }
@@ -860,7 +928,7 @@ impl<'a> AddrCtx<'a> {
                 return None;
             }
             let phi = &self.p.blocks[def_b].phis[pi];
-            if !self.p.blocks[def_b].preds.iter().all(|&q| self.all[q]) {
+            if !self.p.blocks[def_b].preds.iter().all(|&q| self.uniform_block(q)) {
                 return None;
             }
             let mut seen = HashSet::new();
@@ -873,6 +941,8 @@ impl<'a> AddrCtx<'a> {
                     &self.def_inst,
                     &self.def_phi,
                     &self.waterfall_loads,
+                    &self.scalar,
+                    self.writes_memory,
                     &self.reg_inputs,
                     a,
                     &mut seen,
@@ -909,6 +979,8 @@ impl<'a> AddrCtx<'a> {
                 &self.def_inst,
                 &self.def_phi,
                 &self.waterfall_loads,
+                &self.scalar,
+                self.writes_memory,
                 &self.reg_inputs,
                 v,
                 &mut seen,
@@ -1174,8 +1246,14 @@ fn sym_add(a: SymVal, b: SymVal) -> Option<SymVal> {
             let mut tid = [0u64; 3];
             for d in 0..3 {
                 tid[d] = ea.tid[d].checked_add(eb.tid[d])?;
+                if tid[d] >= MAX_OFFSET {
+                    return None;
+                }
             }
             let console_lane = ea.console_lane.checked_add(eb.console_lane)?;
+            if console_lane >= MAX_OFFSET {
+                return None;
+            }
             let tz = ea.known_zero.trailing_ones().min(eb.known_zero.trailing_ones());
             let max_val = match (ea.max_val, eb.max_val) {
                 (Some(ma), Some(mb)) => ma.checked_add(mb).filter(|&m| m <= u64::from(u32::MAX)),
@@ -1206,12 +1284,14 @@ fn sym_shl(x: SymVal, shift: SymVal) -> Option<SymVal> {
             if s > 20 {
                 return None;
             }
-            let off = e.offset.checked_shl(s)?;
+            let factor_u64 = 1u64 << s;
+            let factor_u32 = u32::try_from(factor_u64).ok()?;
+            let off = e.offset.checked_mul(factor_u64)?;
             if off >= MAX_OFFSET {
                 return None;
             }
             for (_, coeff) in &mut e.uniforms {
-                *coeff = coeff.checked_shl(s)?;
+                *coeff = coeff.checked_mul(factor_u32)?;
             }
             e.uniform_tz = if e.uniforms.is_empty() {
                 32
@@ -1219,14 +1299,20 @@ fn sym_shl(x: SymVal, shift: SymVal) -> Option<SymVal> {
                 e.uniform_tz.saturating_add(s).min(32)
             };
             for c in &mut e.tid {
-                *c = c.checked_shl(s)?;
+                *c = c.checked_mul(factor_u64)?;
+                if *c >= MAX_OFFSET {
+                    return None;
+                }
             }
-            e.console_lane = e.console_lane.checked_shl(s)?;
+            e.console_lane = e.console_lane.checked_mul(factor_u64)?;
+            if e.console_lane >= MAX_OFFSET {
+                return None;
+            }
             e.offset = off;
             e.known_zero = e.known_zero.wrapping_shl(s) | tz_mask(s);
             e.max_val = e
                 .max_val
-                .and_then(|m| m.checked_shl(s))
+                .and_then(|m| m.checked_mul(factor_u64))
                 .filter(|&m| m <= u64::from(u32::MAX));
             Some(SymVal::Linear(e))
         }
@@ -1259,8 +1345,14 @@ fn sym_mul(a: SymVal, b: SymVal) -> Option<SymVal> {
             };
             for c in &mut e.tid {
                 *c = c.checked_mul(k64)?;
+                if *c >= MAX_OFFSET {
+                    return None;
+                }
             }
             e.console_lane = e.console_lane.checked_mul(k64)?;
+            if e.console_lane >= MAX_OFFSET {
+                return None;
+            }
             e.offset = off;
             let tz = e
                 .known_zero
@@ -1312,6 +1404,7 @@ fn sym_or(a: SymVal, b: SymVal) -> Option<SymVal> {
 }
 
 /// Computes blocks reachable from entry using only group-uniform scalar branches and `all` blocks.
+#[allow(clippy::too_many_arguments)]
 fn compute_uniform_cfg(
     p: &Program,
     st: &Structured,
@@ -1319,22 +1412,46 @@ fn compute_uniform_cfg(
     def_inst: &HashMap<Value, (usize, usize)>,
     reg_inputs: &HashMap<Value, InputKind>,
     waterfall_loads: &HashSet<(usize, usize)>,
+    scalar: &HashMap<(usize, usize), Address>,
+    writes_memory: bool,
 ) -> Vec<bool> {
     let n = p.blocks.len();
     let mut bad_branch = vec![false; n];
     for (b, block) in p.blocks.iter().enumerate().take(st.exits.len()) {
+        if !all[b] {
+            continue;
+        }
         if let LaneExit::Branch {
-            taken, not_taken, ..
+            taken,
+            not_taken,
+            when,
         } = st.exits[b]
-            && all[taken]
-            && all[not_taken]
         {
-            bad_branch[b] = !is_uniform_branch(p, st, all, def_inst, reg_inputs, waterfall_loads, block);
+            let scalar_or_wide = st.wide.contains(&b)
+                || st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_)))
+                || (all[taken] && all[not_taken]);
+            if scalar_or_wide {
+                bad_branch[b] = !is_uniform_branch(
+                    p,
+                    st,
+                    all,
+                    def_inst,
+                    reg_inputs,
+                    waterfall_loads,
+                    scalar,
+                    writes_memory,
+                    block,
+                );
+            }
         }
     }
 
-    // Propagate conservatively: any block downstream of a non-group-uniform scalar branch
-    // between two `all` blocks is marked non-uniform.
+    // Propagate conservatively: any block downstream of a non-group-uniform scalar/wide branch
+    // is marked non-uniform.
     let mut non_uniform = vec![false; n];
     let mut queue = VecDeque::new();
     for b in 0..n {
@@ -1362,6 +1479,7 @@ fn compute_uniform_cfg(
     all.iter().enumerate().map(|(b, &a)| a && !non_uniform[b]).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn is_uniform_branch(
     p: &Program,
     st: &Structured,
@@ -1369,6 +1487,8 @@ fn is_uniform_branch(
     def_inst: &HashMap<Value, (usize, usize)>,
     reg_inputs: &HashMap<Value, InputKind>,
     waterfall_loads: &HashSet<(usize, usize)>,
+    scalar: &HashMap<(usize, usize), Address>,
+    writes_memory: bool,
     block: &Block,
 ) -> bool {
     let Some(last) = block.insts.last() else {
@@ -1391,6 +1511,8 @@ fn is_uniform_branch(
         def_inst,
         &def_phi,
         waterfall_loads,
+        scalar,
+        writes_memory,
         reg_inputs,
         scc,
         &mut seen,
@@ -1406,6 +1528,8 @@ fn is_group_uniform_val(
     def_inst: &HashMap<Value, (usize, usize)>,
     def_phi: &HashMap<Value, (usize, usize)>,
     waterfall_loads: &HashSet<(usize, usize)>,
+    scalar: &HashMap<(usize, usize), Address>,
+    writes_memory: bool,
     reg_inputs: &HashMap<Value, InputKind>,
     v: Value,
     seen: &mut HashSet<Value>,
@@ -1433,6 +1557,8 @@ fn is_group_uniform_val(
                 def_inst,
                 def_phi,
                 waterfall_loads,
+                scalar,
+                writes_memory,
                 reg_inputs,
                 a,
                 seen,
@@ -1467,6 +1593,8 @@ fn is_group_uniform_val(
                             def_inst,
                             def_phi,
                             waterfall_loads,
+                            scalar,
+                            writes_memory,
                             reg_inputs,
                             rv,
                             seen,
@@ -1484,6 +1612,8 @@ fn is_group_uniform_val(
                         def_inst,
                         def_phi,
                         waterfall_loads,
+                        scalar,
+                        writes_memory,
                         reg_inputs,
                         rv,
                         seen,
@@ -1495,7 +1625,7 @@ fn is_group_uniform_val(
     };
 
     match &inst.fields {
-        Fields::Sop { dst, src, .. } => {
+        Fields::Sop { .. } => {
             if matches!(
                 name,
                 "s_memtime" | "s_memrealtime" | "s_getreg_b32" | "s_getpc_b64" | "s_sendmsg"
@@ -1504,14 +1634,9 @@ fn is_group_uniform_val(
             {
                 return false;
             }
-            if matches!(name, "s_addk_i32" | "s_mulk_i32") && !dst.as_ref().is_some_and(|d| check_op(d, seen)) {
-                return false;
-            }
-            if name == "s_cselect_b32" {
-                let Some(scc) = inst.read(Reg::Scc) else {
-                    return false;
-                };
-                if !is_group_uniform_val(
+            inst.reads.iter().all(|&(r, rv)| match r {
+                Reg::S(c) if (106..PARKED).contains(&c) => false,
+                Reg::Scc | Reg::S(_) | Reg::V(_) => is_group_uniform_val(
                     p,
                     st,
                     all,
@@ -1519,47 +1644,89 @@ fn is_group_uniform_val(
                     def_inst,
                     def_phi,
                     waterfall_loads,
+                    scalar,
+                    writes_memory,
                     reg_inputs,
-                    scc,
+                    rv,
                     seen,
-                ) {
-                    return false;
-                }
-            }
-            let reads_unmodeled_special = inst.reads.iter().any(|&(r, _)| match r {
-                Reg::Scc => !name.starts_with("s_cselect") && !name.starts_with("s_addc") && !name.starts_with("s_subb"),
-                Reg::S(c) => (106..PARKED).contains(&c) && c != EXEC && c != EXEC + 1,
-                _ => false,
-            });
-            if reads_unmodeled_special {
-                return false;
-            }
-            src.iter().all(|op| check_op(op, seen))
+                ),
+            })
         }
-        Fields::Smem { base, soffset, cache, .. } => {
+        Fields::Smem {
+            base,
+            soffset,
+            cache,
+            ..
+        } => {
+            let immutable_source = scalar.get(&(b, i)).is_some_and(|a| {
+                a.param == CODE || (a.param != MEMORY && a.dynamic.is_none() && !writes_memory)
+            });
             name.starts_with("s_load_dword")
                 && !cache.glc
                 && !cache.slc
+                && immutable_source
                 && check_op(base, seen)
                 && check_op(soffset, seen)
         }
         Fields::Valu(valu) => {
-            if has_valu_modifiers(valu)
-                || name.starts_with("v_read")
-                || name.starts_with("v_writelane")
-                || name.starts_with("v_permlane")
-                || name.starts_with("v_mbcnt")
-                || name.starts_with("v_cndmask")
-                || name.starts_with("v_cmp")
-                || name.starts_with("v_movrel")
-                || name.starts_with("v_swap")
-                || name.starts_with("v_div_fmas")
-                || name.starts_with("v_interp")
-                || name.ends_with("_co_ci_u32")
-            {
+            let safe_valu = matches!(
+                name,
+                "v_mov_b32"
+                    | "v_add_nc_u32"
+                    | "v_add_u32"
+                    | "v_add_co_u32"
+                    | "v_add3_u32"
+                    | "v_sub_nc_u32"
+                    | "v_subrev_nc_u32"
+                    | "v_sub_co_u32"
+                    | "v_subrev_co_u32"
+                    | "v_mul_lo_u32"
+                    | "v_mul_hi_u32"
+                    | "v_mul_hi_i32"
+                    | "v_mul_u32_u24"
+                    | "v_mul_i32_i24"
+                    | "v_mad_u32_u24"
+                    | "v_mad_i32_i24"
+                    | "v_lshlrev_b32"
+                    | "v_lshrrev_b32"
+                    | "v_ashrrev_i32"
+                    | "v_lshl_add_u32"
+                    | "v_add_lshl_u32"
+                    | "v_lshl_or_b32"
+                    | "v_and_b32"
+                    | "v_or_b32"
+                    | "v_xor_b32"
+                    | "v_and_or_b32"
+                    | "v_or3_b32"
+                    | "v_xor3_b32"
+                    | "v_xad_u32"
+                    | "v_bfe_u32"
+                    | "v_bfe_i32"
+                    | "v_bfi_b32"
+                    | "v_bfrev_b32"
+                    | "v_bcnt_u32_b32"
+                    | "v_min_u32"
+                    | "v_max_u32"
+                    | "v_min_i32"
+                    | "v_max_i32"
+                    | "v_min3_u32"
+                    | "v_max3_u32"
+                    | "v_min3_i32"
+                    | "v_max3_i32"
+                    | "v_med3_u32"
+                    | "v_med3_i32"
+                    | "v_alignbit_b32"
+                    | "v_alignbyte_b32"
+            );
+            if has_valu_modifiers(valu) || !safe_valu {
                 return false;
             }
-            valu.src.iter().all(|op| check_op(op, seen))
+            let bad_read = inst.reads.iter().any(|&(r, _)| match r {
+                Reg::Scc => true,
+                Reg::S(c) => (106..PARKED).contains(&c) && c != EXEC && c != EXEC + 1,
+                _ => false,
+            });
+            !bad_read && valu.src.iter().all(|op| check_op(op, seen))
         }
         _ => false,
     }
@@ -2170,5 +2337,150 @@ mod tests {
         nop_body.extend(ds_write_b32(2, 3, 0));
         nop_body.extend(store_uav(3));
         assert!(run_meetings(&if_v0_lt_s0(&nop_body), [64, 1, 1], 1).is_none());
+    }
+
+    #[test]
+    fn non_uniform_sop_cycles_smem_and_shift_overflow_refused() {
+        // 1a. s_addc_u32 reading non-uniform SCC from v_readfirstlane -> MUST refuse (`64`).
+        // 0xD760_0002, (128<<9)|256 = v_readfirstlane_b32 s2, v0 -> wait: VOP1 op 2 is v_readfirstlane_b32!
+        // Look up VOP1: 0x7E00_0000 | (vdst << 17) | (2 << 9) | (256+vsrc) = 0x7E04_0500 (s2, v0).
+        // s_cmp_eq_u32 s2, 0 -> SOPC op 0: 0xBF00_8002; s_addc_u32 s3, 0, 0 -> SOP2 op 4: 0x8203_8080;
+        // s_lshl_b32 s3, s3, 2 -> SOP2 op 0x1e: 0x8F03_8203.
+        let mut addc_body = vec![
+            0x7E04_0500, // v_readfirstlane_b32 s2, v0
+            0xBF00_8002, // s_cmp_eq_u32 s2, 0
+            0x8203_8080, // s_addc_u32 s3, 0, 0
+            0x8F03_8203, // s_lshl_b32 s3, s3, 2
+        ];
+        let mut addc_inner = vec![v_mov_s(2, 3), v_mov_k(3, 7)];
+        addc_inner.extend(ds_write_b32(2, 3, 0));
+        addc_inner.extend(ds_read_b32(4, 2, 4));
+        addc_inner.extend(store_uav(4));
+        addc_body.extend(if_v0_lt_s0(&addc_inner));
+        assert!(run_meetings(&addc_body, [64, 1, 1], 1).is_none());
+        assert_eq!(lowered_wave(&addc_body, [64, 1, 1], 1), 64);
+
+        // 1b. s_bitset0_b32 mutating a non-uniform SGPR (reads old dst) -> MUST refuse (`64`).
+        // SOP1 op 0x1b (s_bitset0_b32): 0xBE80_0000 | (sdst<<16) | (0x1b<<8) | src0 = 0xBE82_1B80 (s2, 0)
+        let mut bitset_body = vec![
+            0x7E04_0500, // v_readfirstlane_b32 s2, v0
+            0xBE82_1B80, // s_bitset0_b32 s2, 0
+        ];
+        let mut bitset_inner = vec![v_mov_s(2, 2), v_mov_k(3, 7)];
+        bitset_inner.extend(ds_write_b32(2, 3, 0));
+        bitset_inner.extend(ds_read_b32(4, 2, 4));
+        bitset_inner.extend(store_uav(4));
+        bitset_body.extend(if_v0_lt_s0(&bitset_inner));
+        assert!(run_meetings(&bitset_body, [64, 1, 1], 1).is_none());
+        assert_eq!(lowered_wave(&bitset_body, [64, 1, 1], 1), 64);
+
+        // 1c. s_and_saveexec_b64 reading EXEC in `all` block -> old EXEC s2 MUST NOT be treated uniform!
+        let mut saveexec_body = vec![
+            0xBE82_2480, // s_and_saveexec_b64 s[2:3], 0 (wait: s_mov_b32 s2, 0? Test s_and_saveexec s[2:3], -1 = 0xBE82_24C1)
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        ];
+        let mut saveexec_inner = vec![v_mov_s(2, 2), v_mov_k(3, 7)];
+        saveexec_inner.extend(ds_write_b32(2, 3, 0));
+        saveexec_inner.extend(ds_read_b32(4, 2, 4));
+        saveexec_inner.extend(store_uav(4));
+        saveexec_body.extend(if_v0_lt_s0(&saveexec_inner));
+        assert!(run_meetings(&saveexec_body, [64, 1, 1], 1).is_none());
+
+        // 2. Non-uniform s_cbranch_scc0 feeding a scalar Phi -> MUST refuse (`64`).
+        let mut phi_cfg_body = vec![
+            0x7E04_0500, // v_readfirstlane_b32 s2, v0
+            0xBF00_8002, // s_cmp_eq_u32 s2, 0
+            0xBF84_0002, // s_cbranch_scc0 else_blk
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBF82_0001, // s_branch join
+            0xBE83_0384, // else_blk: s_mov_b32 s3, 4
+        ];
+        let mut phi_inner = vec![v_mov_s(2, 3), v_mov_k(3, 7)];
+        phi_inner.extend(ds_write_b32(2, 3, 0));
+        phi_inner.extend(ds_read_b32(4, 2, 4));
+        phi_inner.extend(store_uav(4));
+        phi_cfg_body.extend(if_v0_lt_s0(&phi_inner));
+        assert!(run_meetings(&phi_cfg_body, [64, 1, 1], 1).is_none());
+
+        // 3a. !all loop with constant disjoint [0, 4) write + [4, 8) read (Refinement A) -> MUST refuse (`64`)
+        // because cross-iteration WAW on byte 0 has no in-loop barrier!
+        let mut loop_ref_a = vec![
+            v_mov_k(2, 0),
+            v_mov_k(3, 7),
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0007, // s_cbranch_execz -> restore
+            // loop header (6 dwords before s_cbranch_vccnz back to v_add_nc_sv):
+            v_add_nc_sv(3, 129, 3), // v3 += 1
+            ds_write_b32(2, 3, 0)[0],
+            ds_write_b32(2, 3, 0)[1],
+            ds_read_b32(4, 2, 4)[0],
+            ds_read_b32(4, 2, 4)[1],
+            0x7D88_0401, // v_cmp_gt_u32 vcc, s1, v3
+            0xBF87_FFF8, // s_cbranch_vccnz loop
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ];
+        loop_ref_a.extend(store_uav(4));
+        assert!(run_meetings(&loop_ref_a, [64, 1, 1], 1).is_none());
+        assert_eq!(lowered_wave(&loop_ref_a, [64, 1, 1], 1), 64);
+
+        // 3b. !all loop with Refinement B lane-private tid * 4 write+read -> ACCEPTED (`32`).
+        let mut loop_ref_b = vec![
+            v_lshlrev_k(2, 2, 0),
+            v_mov_k(3, 7),
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0007, // s_cbranch_execz -> restore
+            v_add_nc_sv(3, 129, 3), // v3 += 1
+            ds_write_b32(2, 3, 0)[0],
+            ds_write_b32(2, 3, 0)[1],
+            ds_read_b32(4, 2, 0)[0],
+            ds_read_b32(4, 2, 0)[1],
+            0x7D88_0401,
+            0xBF87_FFF8,
+            0xBEFE_040C,
+        ];
+        loop_ref_b.extend(store_uav(4));
+        assert!(run_meetings(&loop_ref_b, [64, 1, 1], 1).is_some());
+        assert_eq!(lowered_wave(&loop_ref_b, [64, 1, 1], 1), 32);
+
+        // 4. Fields::Smem mutable global MEMORY load (s_load_dword s2, s[0:1], 0) + UAV write -> MUST refuse.
+        let mut smem_mut = vec![
+            0x3D << 26 | 2 << 6, // s_load_dword s2, s[0:1], 0 (s[0:1] = Constants root param -> MEMORY)
+            125 << 25,
+        ];
+        let mut smem_inner = vec![v_mov_s(2, 2), v_mov_k(3, 7)];
+        smem_inner.extend(ds_write_b32(2, 3, 0));
+        smem_inner.extend(ds_read_b32(4, 2, 4));
+        smem_inner.extend(store_uav(4));
+        smem_mut.extend(if_v0_lt_s0(&smem_inner));
+        assert!(run_meetings(&smem_mut, [64, 1, 1], 1).is_none());
+
+        // 5. sym_shl overflow: (s1 << 16) << 16 wraps coeff to 0, and (tid << 16) << 16 wraps tid to 0 -> REFUSED.
+        let mut shl_wrap_u = vec![
+            v_lshlrev_k(2, 16, 0),
+            v_lshlrev_k(2, 16, 2), // v2 == (tid << 16) << 16 == 0!
+            v_mov_k(3, 7),
+        ];
+        shl_wrap_u.extend(ds_write_b32(2, 3, 0));
+        shl_wrap_u.extend(ds_read_b32(4, 2, 0));
+        shl_wrap_u.extend(store_uav(4));
+        assert!(run_meetings(&if_v0_lt_s0(&shl_wrap_u), [64, 1, 1], 1).is_none());
+        assert_eq!(lowered_wave(&if_v0_lt_s0(&shl_wrap_u), [64, 1, 1], 1), 64);
+
+        // Uniform base double shift inside !all: v2 = (s1 << 16) << 16 (wraps coeff to 0 -> looks like 0!)
+        // paired with v5 = 0 -> MUST refuse!
+        let mut shl_wrap_coeff = vec![
+            0x7E04_0201, // v_mov_b32 v2, s1
+            v_lshlrev_k(2, 16, 2),
+            v_lshlrev_k(2, 16, 2),
+            v_mov_k(5, 0),
+            v_mov_k(3, 7),
+        ];
+        shl_wrap_coeff.extend(ds_write_b32(5, 3, 0));
+        shl_wrap_coeff.extend(ds_read_b32(4, 2, 0));
+        shl_wrap_coeff.extend(store_uav(4));
+        assert!(run_meetings(&if_v0_lt_s0(&shl_wrap_coeff), [64, 1, 1], 1).is_none());
+        assert_eq!(lowered_wave(&if_v0_lt_s0(&shl_wrap_coeff), [64, 1, 1], 1), 64);
     }
 }
