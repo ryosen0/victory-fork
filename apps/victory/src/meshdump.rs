@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use victory_shader::structure::{Atom, LaneExit};
-use victory_shader::{Container, FourCC, HwStage, gfx10, ir, native::StageIo, native_programs, structure};
+use victory_shader::{
+    Container, FourCC, HwStage, gfx10, ir, native::StageIo, native_programs, structure,
+};
 
 use crate::shader::{MAX_FILE, sources};
 
@@ -33,7 +35,9 @@ pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool, compute: bool) -
                 continue;
             };
             for source in sources(&data) {
-                let Some(bytes) = source.bytes() else { continue };
+                let Some(bytes) = source.bytes() else {
+                    continue;
+                };
                 let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
                 if !seen.insert(hash.clone()) {
                     continue;
@@ -41,12 +45,19 @@ pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool, compute: bool) -
                 if !want.is_empty() && !want.contains(&hash) {
                     continue;
                 }
-                let Ok(c) = Container::parse(&bytes) else { continue };
-                let Some(dxil) = c.part(FourCC::DXIL) else { continue };
-                let Ok(programs) = native_programs(dxil.data) else { continue };
-                for n in programs.into_iter().filter(|p| {
-                    p.stage == HwStage::Ms || (compute && p.stage == HwStage::Cs)
-                }) {
+                let Ok(c) = Container::parse(&bytes) else {
+                    continue;
+                };
+                let Some(dxil) = c.part(FourCC::DXIL) else {
+                    continue;
+                };
+                let Ok(programs) = native_programs(dxil.data) else {
+                    continue;
+                };
+                for n in programs
+                    .into_iter()
+                    .filter(|p| p.stage == HwStage::Ms || (compute && p.stage == HwStage::Cs))
+                {
                     // The group shape line differs by stage; the barrier
                     // analysis below is the same for both.
                     let shape = match &n.io {
@@ -56,12 +67,17 @@ pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool, compute: bool) -
                         ),
                         StageIo::Cs(cs) => format!(
                             "cs threads={}x{}x{} lds={}",
-                            cs.threads[0], cs.threads[1], cs.threads[2], cs.lds_bytes()
+                            cs.threads[0],
+                            cs.threads[1],
+                            cs.threads[2],
+                            cs.lds_bytes()
                         ),
                         _ => continue,
                     };
                     total += 1;
-                    let Ok(insts) = gfx10::decode(&n.code) else { continue };
+                    let Ok(insts) = gfx10::decode(&n.code) else {
+                        continue;
+                    };
                     let barriers: Vec<usize> = insts
                         .iter()
                         .filter(|i| i.name() == Some("s_barrier"))
@@ -81,7 +97,12 @@ pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool, compute: bool) -
                         && let Ok(st) = structure::structure(&p)
                     {
                         for (b, exit) in st.exits.iter().enumerate() {
-                            if let LaneExit::Branch { when, taken, not_taken } = *exit {
+                            if let LaneExit::Branch {
+                                when,
+                                taken,
+                                not_taken,
+                            } = *exit
+                            {
                                 let uniform = st
                                     .bools
                                     .support(when)
@@ -97,9 +118,7 @@ pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool, compute: bool) -
                             .blocks
                             .iter()
                             .enumerate()
-                            .filter(|(_, b)| {
-                                b.insts.iter().any(|i| i.name() == "s_barrier")
-                            })
+                            .filter(|(_, b)| b.insts.iter().any(|i| i.name() == "s_barrier"))
                             .map(|(k, _)| k)
                             .collect();
                         // Reachability from entry avoiding the "other" side
@@ -109,12 +128,19 @@ pub fn run(paths: Vec<PathBuf>, hashes: Vec<String>, isa: bool, compute: bool) -
                         for &(b, taken, not_taken) in &lane_branch_blocks {
                             for &(skip, keep) in &[(taken, not_taken), (not_taken, taken)] {
                                 let reach = reach_avoiding(&p, b, skip);
-                                if bar_blocks.iter().any(|&bb| !reach[bb] && reachable(&p, keep, bb)) {
+                                if bar_blocks
+                                    .iter()
+                                    .any(|&bb| !reach[bb] && reachable(&p, keep, bb))
+                                {
                                     any_divergent = true;
                                 }
                             }
                         }
-                        verdict = if any_divergent { "DIVERGENT" } else { "all-lanes" };
+                        verdict = if any_divergent {
+                            "DIVERGENT"
+                        } else {
+                            "all-lanes"
+                        };
                         if any_divergent {
                             divergent += 1;
                         }

@@ -93,16 +93,6 @@ enum Command {
         #[arg(long)]
         warm: Option<PathBuf>,
     },
-    /// Survey mesh programs: group shape, LDS, barriers, divergent barriers.
-    Meshdump {
-        paths: Vec<PathBuf>,
-        /// Only containers whose 16-hex content hash is listed.
-        #[arg(long = "hash")]
-        hashes: Vec<String>,
-        /// Also print the decoded GFX10 instructions of each mesh program.
-        #[arg(long)]
-        isa: bool,
-    },
     /// Survey mesh (and with --compute, compute) programs: group shape, LDS,
     /// barriers, divergent barriers.
     Meshdump {
@@ -187,11 +177,17 @@ fn main() -> Result<()> {
             warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_host_max_wave(n);
             }
             if let Some(file) = warm {
@@ -199,7 +195,12 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Meshdump { paths, hashes, isa, compute } => meshdump::run(paths, hashes, isa, compute),
+        Command::Meshdump {
+            paths,
+            hashes,
+            isa,
+            compute,
+        } => meshdump::run(paths, hashes, isa, compute),
         Command::Run {
             exe,
             unimplemented,
