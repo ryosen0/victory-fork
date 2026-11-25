@@ -228,6 +228,19 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 
 /// A format as the host has it. The console's 16-bit depth with stencil
 /// (and its typeless views) has no PC format: the 24-bit ones stand in.
+/// Whether a PC format is an integer one (UINT or SINT). Blending is
+/// disabled on such targets, as the console ignores it and D3D12 refuses it
+/// (a port of belobug:pr:45).
+pub(crate) fn is_integer(format: u32) -> bool {
+    // DXGI_FORMAT enums for UINT/SINT formats.
+    // This list is not exhaustive, but covers the formats the title uses
+    // and the stand-ins we use.
+    matches!(
+        format,
+        45 | 46 | 47 | 48 | 49 | 50 | 51 | 52 | 53 | 54 | 55 | 56 | 57 | 58 | 59 | 60 | 61 | 62
+    )
+}
+
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
         118 => 45,
