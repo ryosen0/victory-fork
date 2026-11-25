@@ -37,6 +37,11 @@ developer or publisher.
   meshdump tooling and low-address guards from the race forks. Resolution
   levers (`VICTORY_RENDER_SCALE`, `VICTORY_OWN_UPSCALER`) carry code by
   **ZigZagBoi1/ScarlettPort** (GPL-3.0-or-later), same byte checks and build pin.
+- The relay write-back fix follows **#786 by AscilCH** (fxceless/victory-fork)
+  and upstream VIctory #2009; the missing-skin measurement that identified it
+  is **#89 by Drdg263**. Pixel quad reads reaching helper lanes are code by
+  **beloooo** ([Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD),
+  commit `03629f3`, GPL-3.0-or-later).
 - This fork's changes were developed with AI coding assistance.
 
 ## Status of own/main (2026-11-25)
@@ -66,10 +71,35 @@ workspace), median over world frames.
 | `VICTORY_RENDER_SCALE=0.5` + own upscaler | median 3.3; world GPU time outside copy-back is only ~9 ms — nothing to cut; upscale visually clean | lever kept, **off** for this card |
 | `VICTORY_CARD_FETCH_INFLIGHT=1` (#648 mechanism) | fetch wait 190→54 ms, landing 216→90 ms (mechanism works); fps gain unproven — the run landed in a heavier scene | off pending a fair re-test |
 | relay=2 / LATE_WAIT=3 / WIDE_BACK / card buffers ≥1 MB | already the defaults of this tree (inherited from upstream main) | on |
+| relay merges carry title writes in one write (#786 mechanism, upstream #2009) | the three relay paths wrote the whole first-to-last differing stretch **as it was read**, putting the title's newer bytes in untouched gaps back to older ones — measured elsewhere as missing character skin with the relay on (#89). Now the untouched bytes are re-read from title memory as it is now and carried into the one write | **in own/main** (`26380b5`) |
+| …writing one kernel call per changed run instead | correct about the bytes, ruinous about the calls: 18,000-20,000 runs a frame, each a kernel call whatever its size. Copy-back 750-1,010 ms/frame, 0.9-1.2 fps (own6) against 190-250 ms and 4.9-5.3 fps before | **rejected by our own measurement**, replaced by the row above |
+| pixel quad reads reach helper lanes (Belobug `03629f3`) | a manual derivative at a triangle's edge read only active lanes, so the texture took its smallest level: lines on car paint, glass and skin. 215 shader tests pass | **in own/main** (`0d8525d`) |
 
-Known visual defects being worked: black character skin, a few floating
-black quads (likely the two refused wave64 compute programs), black ground
-and shadows (RT not running).
+Known visual defects being worked: black character skin (the relay write-back
+race above is the leading cause — see #89), a few floating black quads (likely
+the two refused wave64 compute programs), black ground and shadows (RT not
+running).
+
+### Where the frame goes, and what would move it
+
+Measured here: copy-back is ~96% of the GPU part of a world frame. The race's
+issue #650 measures the same shape on a 12 GB card: the title's 174 MB
+GPU-heap buffer is compared twice a frame — 365 MB compared for 2.3 MB
+written back, 99.4% unchanged. Upstream fixed that by having shaders mark the
+64 KiB pages they write through views, so copy-back compares only those
+(`cd94d35` + `940d32f`). That is **not** a drop-in here: it builds on two
+upstream rewrites this tree does not have, ~85 conflict hunks in 20 files. It
+is the largest remaining lever on this card and wants redoing on our own
+copy-back path, not cherry-picking.
+
+### A lesson this fork keeps
+
+Correct about the bytes is not the same as affordable. Writing only the
+changed byte runs is the right thing for the data and the wrong thing for
+the frame: a run each is a kernel call, and this title's merges produce
+twenty thousand of them. Every candidate is measured on this card before
+it stays, and a rejected one is written down with its numbers — see the
+table above.
 
 ### Branches
 
