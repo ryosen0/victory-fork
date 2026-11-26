@@ -198,6 +198,7 @@ fn sweep() {
     {
         return;
     }
+    crate::residency::refresh();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -8331,6 +8332,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
             }

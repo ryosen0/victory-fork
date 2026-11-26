@@ -58,6 +58,8 @@ pub mod query;
 pub mod queue;
 #[cfg(windows)]
 mod queue2;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

@@ -68,8 +68,9 @@ thread_local! {
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
-    /// pass's own per frame.
-    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// pass's own per frame, and whether it is a bake (which may cross the
+    /// shared frame ceiling; `crate::residency` gives it priority too).
+    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -1758,7 +1759,7 @@ impl State {
             );
         }
         let began = std::time::Instant::now();
-        PASS_BUDGET.set(Some(budget));
+        PASS_BUDGET.set(Some((budget.0, budget.1, bake)));
         self.heap_textures(list, heap, host);
         PASS_BUDGET.set(None);
         if bake {
@@ -1912,6 +1913,14 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
+        // The host is short of commit memory: no speculative texture work
+        // this pass (`crate::residency`, the coolfox line's `ab75ac3e`).
+        // The slots stay due, and the pass returns to them when the
+        // shortage passes.
+        let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
+        if !crate::residency::admit_texture_pass(required) {
+            return;
+        }
         let (due, census) = host.texture_slots_due(frame, 4096);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
@@ -1960,7 +1969,7 @@ impl State {
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
+            Some((ms, bytes, _)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
             }
             None => (span, per_frame),
@@ -2090,6 +2099,12 @@ impl State {
             }
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+            // A driver allocation just failed: this pass's other uploads
+            // would ask against the same shortage (`crate::residency`). The
+            // slot stays due, and the pass returns to it.
+            if crate::residency::upload_refused() {
+                break;
+            }
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {

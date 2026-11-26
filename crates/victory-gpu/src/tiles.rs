@@ -147,6 +147,13 @@ impl Heap {
 /// the card (a texture names its heaps by place).
 static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 
+/// The time before which a new heap is not asked for, after one creation
+/// failed: a shortage of commit rarely passes in a frame, and every texture
+/// level of a pass asking once made a shortage of its own (the backoff of
+/// the coolfox line's `Pool::grow`, `ab75ac3e`). Free runs remain usable
+/// during it.
+static RETRY_GROWTH_AT: AtomicU64 = AtomicU64::new(0);
+
 /// `count` tiles of one heap, in as many runs as it takes, the lowest free
 /// tiles first (single free tiles are used up before a long run is cut):
 /// the heap, its place in the pool and the runs (first tile, tiles). A new
@@ -160,6 +167,12 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     let index = match found {
         Some(index) => index,
         None => {
+            // A new heap, unless one just failed to be made: then this and
+            // the pass's other asks wait for the shortage to pass
+            // (`RETRY_GROWTH_AT`).
+            if crate::host::now_ms() < RETRY_GROWTH_AT.load(Ordering::Relaxed) {
+                return None;
+            }
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: u64::from(HEAP_TILES) * TILE,
                 Properties: D3D12_HEAP_PROPERTIES {
@@ -172,6 +185,8 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             let mut made: Option<ID3D12Heap> = None;
             // SAFETY: plain creation; the out pointer is ours.
             if let Err(e) = unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) } {
+                crate::residency::allocation_error(&e);
+                RETRY_GROWTH_AT.store(crate::host::now_ms().saturating_add(500), Ordering::Relaxed);
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
                 return None;
             }
