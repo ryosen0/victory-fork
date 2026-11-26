@@ -688,12 +688,12 @@ fn record_gather_as(
 /// until the list's reset ([`HostList::indirect_readable`]): a scratch of
 /// an earlier recording ([`Gather::spare`]) comes back in that state, and
 /// its next pass transitions from it, not from common. Between the sets
-/// the global UAV waits are elided (`VICTORY_INDIRECT_GATHER_ELIDE=0` keeps
-/// them): each set writes its own scratch and reads only its own source
-/// and table, so one wait before the first pass and one after the last
-/// order the whole window; the state transitions stay (PR #220's barrier
-/// elision, applied where it is safe — between clamps into one scratch the
-/// waits stay, they order the writes).
+/// the global UAV waits are kept (`VICTORY_INDIRECT_GATHER_ELIDE=1`
+/// elides them, as before 2026-11-26): each set writes its own scratch and
+/// reads only its own source and table, so one wait before the first pass
+/// and one after the last order the whole window; the state transitions
+/// stay (PR #220's barrier elision, applied where it is safe — between
+/// clamps into one scratch the waits stay, they order the writes).
 pub(crate) fn record_gathers(l: &ID3D12GraphicsCommandList, sets: &[GatherSet], budget: &ID3D12Resource) -> bool {
     let Some(c) = clamp() else {
         return false;
@@ -748,11 +748,13 @@ fn record_gathers_with(c: &Clamp, l: &ID3D12GraphicsCommandList, sets: &[GatherS
 }
 
 /// Whether the gathers of one prelude elide the global UAV waits between
-/// their passes (on by default; `VICTORY_INDIRECT_GATHER_ELIDE=0` keeps a
-/// wait on both sides of every pass, as before).
+/// their passes (off by default since 2026-11-26: the morning run showed
+/// the world flickering before the prologue and a host command list that
+/// did not close, 0x80070057 — the waits are kept between every pass;
+/// `VICTORY_INDIRECT_GATHER_ELIDE=1` restores the elision, as before).
 fn gather_elide() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_GATHER_ELIDE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_GATHER_ELIDE").is_some_and(|v| v == "1"))
 }
 
 /// Whether every draw served from a window is checked against a fresh
