@@ -67,15 +67,14 @@ The game progresses past all introductory titles, survives fullscreen zoom/blur 
 
 ---
 
-## Storage Recommendation: SSD vs Mechanical HDD
+## Storage Architecture: Fast SSD vs Mechanical HDD
 
-> [!IMPORTANT]
-> **This title was built for the Xbox Velocity Architecture (NVMe direct streaming at 2.4–4.8 GB/s).**
+> [!NOTE]
+> **This title targets the Xbox Velocity Architecture (NVMe direct streaming at 2.4–4.8 GB/s).**
 
-Testing has proven that running the ~208 GB game files from a mechanical HDD (e.g. 7200 RPM SATA) causes extreme I/O starvation:
-- **Mechanical HDD:** Random 4K read speeds are ~0.8–1.2 MB/s with 12–15 ms mechanical seek latency. Loading the opening scenes takes 3–5 minutes, and streaming in-game assets causes severe hitches.
-- **SATA SSD (e.g. `E:\ScarlettGame`):** Random 4K read speeds are 35–40 MB/s with 0.05 ms latency (300× faster response). Initial load drops to ~30–45 seconds.
-- **NVMe PCIe 4.0 SSD (e.g. `C:\`):** Speeds up to 7,000 MB/s (1,000,000 IOPS) eliminate streaming bottlenecks completely.
+Running large-scale open-world assets from a mechanical HDD causes noticeable streaming latency:
+- **Mechanical HDD:** Random 4K read throughput (~1 MB/s) with 12–15 ms mechanical seek latency starves DirectStorage texture streams, causing prolonged scene transitions and delayed mipmap streaming.
+- **SATA or NVMe SSD:** Sub-millisecond seek times and higher random 4K IOPS allow asset queues to drain smoothly, cutting initial load times dramatically and preventing in-game streaming hitches. An SSD installation is strongly recommended.
 
 ---
 
@@ -103,8 +102,20 @@ To run with optimal performance and visuals on Ryzen 7 9800X3D + RTX 3060 Ti:
 ### Windows Batch Script (`run_game.bat`)
 ```bat
 @echo off
-title VIctory: Scarlett Game (own14_morning_fixed)
-cd /d "C:\Users\wei\Documents\Scarlett Radio Studio"
+title VIctory Launcher
+cd /d "%~dp0"
+
+:: Pass the game executable as an argument, drag-and-drop it onto this script, or enter path below:
+set "GAME_EXE=%~1"
+if "%GAME_EXE%"=="" (
+    set /p GAME_EXE="Enter full path to game_scarlett_master.exe: "
+)
+
+if not exist "%GAME_EXE%" (
+    echo Error: Game executable not found at "%GAME_EXE%"
+    pause
+    exit /b 1
+)
 
 set VICTORY_LOG=info
 set VICTORY_AMBIENT=1.2
@@ -123,12 +134,7 @@ set VICTORY_NO_WATCHDOG=1
 set VICTORY_DRIVER_WATCH=0
 set VICTORY_SHADER_LOOP_LIMIT=1024
 
-set "GAME_EXE=E:\ScarlettGame\game_scarlett_master.exe"
-if not exist "%GAME_EXE%" (
-    set "GAME_EXE=D:\Games\ScarlettGame\game_scarlett_master.exe"
-)
-
-"C:\Users\wei\Documents\Scarlett Radio Studio\tools\third_party\victory-own\target\diag\victory.exe" run "%GAME_EXE%" --execute
+.\target\diag\victory.exe run "%GAME_EXE%" --execute
 pause
 ```
 
