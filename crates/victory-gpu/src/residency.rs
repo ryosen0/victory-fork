@@ -73,6 +73,7 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
 
 /// Whether the PC has 32 GiB of physical memory or less: spare upload
 /// storage is kept smaller there (the coolfox line's 32 GB setting).
+#[allow(dead_code)]
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
@@ -137,6 +138,7 @@ pub(crate) fn refresh() {
 
 /// The lowest of physical and commit memory free at the last sweep, if one
 /// has run.
+#[allow(dead_code)]
 pub(crate) fn headroom() -> Option<u64> {
     let bytes = HEADROOM.load(Ordering::Relaxed);
     (bytes != u64::MAX).then_some(bytes)
@@ -148,6 +150,7 @@ pub(crate) fn pressured() -> bool {
 
 /// A soft per-frame admission limit. A single texture can cross it. The
 /// queue retains unserved slots so they can be retried on later frames.
+#[allow(dead_code)]
 pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, limited: bool, staging: u64) -> u64 {
     if pressure {
         bytes.min(16 << 20)

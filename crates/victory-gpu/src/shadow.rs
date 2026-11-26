@@ -4065,16 +4065,15 @@ pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// found, weakly (a copy nothing else holds can still be let go), for as
 /// long as the tables have not changed ([`TABLES_CHANGED`]).
 ///
-/// Here: OFF unless `VICTORY_LOOKUP_CACHE=1` until a run of ours has carried
-/// it (the pull request has it on by default); `alt`: twenty seconds with,
-/// twenty without, in turn, each change said in the log.
+/// Default ON (the pull request has it on by default, proven on 2026-11-26 run);
+/// `0` turns off; `alt`: twenty seconds with, twenty without.
 fn lookup_cache() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_LOOKUP_CACHE").as_deref() {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
