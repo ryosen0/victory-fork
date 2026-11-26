@@ -1757,7 +1757,7 @@ void main() {
         }
         let (src_buf, src_ptr, _) = warp.shared_buffer(bytes);
         let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(u64::from(GATHER_MOST) * 4);
-        let (_budget_buf, budget_ptr, _budget_gpu) = warp.shared_buffer(256);
+        let (budget_buf, budget_ptr, _budget_gpu) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer(bytes * 2);
         let scratch_a = warp.default_uav(bytes);
         let scratch_b = warp.default_uav(bytes);

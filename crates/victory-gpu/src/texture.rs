@@ -1188,12 +1188,32 @@ impl Staging {
                 linear.fill(0);
                 continue;
             }
+            // The console layout can be shorter than the host's mip chain:
+            // when its largest levels were dropped for the host
+            // (`VICTORY_TEXTURE_DROP_MIPS`, `staging_layout`) the host keeps
+            // the whole chain while the staging layout keeps the rest. A host
+            // level past the layout's end has no title bytes to read, so it
+            // is left as zeros (it samples as the nothing it holds in title
+            // memory), never a detiling that fails into a region the upload
+            // still hands the card. (Before, the level one past the end was
+            // the last host level of every shrunken texture, and its refused
+            // detiling returned from the whole loop: the subresources behind
+            // it kept whatever the staging buffer happened to hold.)
+            let level = mip + self.first_mip;
+            if level as usize >= self.layout.mips.len() {
+                linear.fill(0);
+                continue;
+            }
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip + self.first_mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, level, slice, linear, pitch, pitch * rows as usize)
             {
+                // A level the layout holds but cannot address (an XOR or MSAA
+                // mode): zeros, and the rest of the texture is still made. The
+                // earlier `return` here abandoned the subresources after it.
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                linear.fill(0);
+                continue;
             }
         }
     }

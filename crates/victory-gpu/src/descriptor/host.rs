@@ -230,7 +230,10 @@ impl Spans {
             .next_back()
             .filter(|(_, span)| span.0 > start)
             .map(|(at, _)| *at);
-        before.into_iter().chain(self.by_start.range(start..end).map(|(at, _)| *at)).collect()
+        // (A range whose end lies below its start has nothing inside; the
+        // map's own lookup panics on one.)
+        let inside = (start < end).then(|| self.by_start.range(start..end).map(|(at, _)| *at));
+        before.into_iter().chain(inside.into_iter().flatten()).collect()
     }
 
     /// Slot `index` holds a view of a texture in `[start, end)`. `newer`:
@@ -305,7 +308,16 @@ impl Spans {
     /// The first span that starts inside `[start, end)` past the first
     /// [`HEAD`] bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
-        self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
+        // A span no longer than its first block has nothing past that block:
+        // a texture of a few texels (a 1x1 one takes 16 bytes), a view of no
+        // bytes, a start at the top of the address space, an end below the
+        // start. The map's lookup panics when the range's start lies above
+        // its end, and the texture pass asks this of textures it uploads.
+        let from = start.saturating_add(HEAD);
+        if from >= end {
+            return None;
+        }
+        self.by_start.range(from..end).next().map(|(at, _)| *at)
     }
 
     /// The slots that hold a view of the texture at `start`.
@@ -3189,6 +3201,44 @@ mod tests {
         // The view from level 1 goes: the texture is viewed from level 3.
         spans.forget(2);
         assert_eq!(spans.first_viewed(0x1_0000), Some(3));
+    }
+
+    /// No lookup over the spans panics on a range that is none or lies at
+    /// an end of the address space: the texture pass asks them of every
+    /// texture it uploads and of every range it is told, on threads that
+    /// record the title's commands. (`next_start` did, for every texture
+    /// shorter than its first block: the map's range lookup panics when the
+    /// start lies above the end.)
+    #[test]
+    fn lookups_over_the_spans_take_any_range() {
+        let mut spans = Spans::default();
+        let at = 0x2000_0000u64;
+        // A texture of 16 bytes (1x1), one of a block, one at address 0 and
+        // one that ends at the top of the address space.
+        assert!(spans.note(1, at, at + 16, true).is_empty());
+        assert!(spans.note(2, at + 0x10_0000, at + 0x10_1000, true).is_empty());
+        assert!(spans.note(3, 0, 0x4_0000, true).is_empty());
+        assert!(spans.note(4, u64::MAX - 0x2_0000, u64::MAX, true).is_empty());
+        // A view of no bytes, and one whose end lies below its start, are
+        // no span.
+        assert!(spans.note(5, at + 0x20_0000, at + 0x20_0000, true).is_empty());
+        assert!(spans.note(6, at + 0x30_0000, at + 0x2f_0000, true).is_empty());
+        // The lookups take those ranges without panicking.
+        for &start in &[0u64, at, at + 16, u64::MAX - 8] {
+            for &end in &[0u64, at, at + 8, u64::MAX] {
+                let _ = spans.next_start(start, end);
+                let _ = spans.slots_in(start, end);
+                let _ = spans.overlapping(start, end);
+            }
+        }
+        // A 1x1 texture shorter than its first block has nothing past it.
+        assert_eq!(spans.next_start(at, at + 16), None);
+        // A view of no bytes, an end below its start, and a range at the
+        // top of the address space are none, never a panic.
+        assert_eq!(spans.next_start(at + 0x20_0000, at + 0x20_0000), None);
+        assert_eq!(spans.next_start(at + 0x30_0000, at + 0x2f_0000), None);
+        assert_eq!(spans.next_start(u64::MAX - 8, u64::MAX), None);
+        assert!(spans.overlapping(at + 0x30_0000, at + 0x2f_0000).is_empty());
     }
 
     /// Views of one placed texture are told from views of others by the
