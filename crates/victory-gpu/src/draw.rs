@@ -808,8 +808,18 @@ impl State {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             let desc = record.depth_desc();
+fn typed_depth_format(format: u32) -> u32 {
+    match format {
+        19 => 20, // DXGI_FORMAT_R32G8X24_TYPELESS -> DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+        39 => 40, // DXGI_FORMAT_R32_TYPELESS -> DXGI_FORMAT_D32_FLOAT
+        44 => 45, // DXGI_FORMAT_R24G8_TYPELESS -> DXGI_FORMAT_D24_UNORM_S8_UINT
+        53 => 55, // DXGI_FORMAT_R16_TYPELESS -> DXGI_FORMAT_D16_UNORM
+        other => other,
+    }
+}
+
             self.depth_state = depth_state(texture, desc.as_ref());
-            formats[8] = bound_format(texture, desc.as_ref().map(|d| d.Format));
+            formats[8] = typed_depth_format(bound_format(texture, desc.as_ref().map(|d| d.Format)));
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }

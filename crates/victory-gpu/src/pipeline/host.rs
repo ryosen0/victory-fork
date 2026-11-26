@@ -117,25 +117,30 @@ pub(crate) type TargetFormats = [u32; 9];
 /// for which the pipeline declares a format AND a view of another format
 /// is bound. A slot nothing is bound to does not count; nor does a view
 /// in a slot the pipeline declares nothing for (the host takes that draw:
-/// nothing is written there, and a pipeline made to write there would
-/// leave the target undefined); nor the depth view (the debug layer named
-/// no depth mismatch in 3,100 frames of run 289, and a depth texture's
-/// own format can be a typeless one no pipeline may declare).
+/// Whether a draw into views of the formats `bound` needs another host
+/// pipeline than the title's, which declares `declared`: a bound view in a
+/// render target slot the pipeline declares a format for but of another
+/// format, or a depth stencil view of another format than declared.
 pub(crate) fn formats_differ(declared: &TargetFormats, bound: &TargetFormats) -> bool {
-    declared[..8].iter().zip(&bound[..8]).any(|(&d, &b)| d != 0 && b != 0 && b != d)
+    let rt_differs = declared[..8].iter().zip(&bound[..8]).any(|(&d, &b)| d != 0 && b != 0 && b != d);
+    let depth_differs = bound[8] != 0 && declared[8] != bound[8];
+    rt_differs || depth_differs
 }
 
 /// The formats a pipeline for a draw into `bound` declares
 /// ([`formats_differ`]): the title's own, but for the render target slots
 /// it declares a format for and a view of another format is bound to,
-/// which take the view's. The count of targets and the depth format stay
-/// the title's.
+/// which take the view's. The depth slot takes the bound depth format if one
+/// is bound.
 pub(crate) fn formats_for(declared: &TargetFormats, bound: &TargetFormats) -> TargetFormats {
     let mut formats = *declared;
     for i in 0..8 {
         if declared[i] != 0 && bound[i] != 0 {
             formats[i] = bound[i];
         }
+    }
+    if bound[8] != 0 {
+        formats[8] = bound[8];
     }
     formats
 }
@@ -174,12 +179,17 @@ impl GraphicsState {
             })
             .collect();
         // (`bound` is what [`formats_for`] gives: the title's count of
-        // targets and its depth format, other formats in some slots.)
+        // targets, with updated render target and depth formats.)
         let mut targets = self.targets;
         let n = (targets.NumRenderTargets as usize).min(8);
         for (to, &from) in targets.RTFormats[..n].iter_mut().zip(bound) {
             *to = DXGI_FORMAT(from as i32);
         }
+        let depth_format = if bound[8] != 0 {
+            DXGI_FORMAT(bound[8] as i32)
+        } else {
+            self.depth_format
+        };
         GraphicsState {
             blend: self.blend,
             sample_mask: self.sample_mask,
@@ -191,7 +201,7 @@ impl GraphicsState {
             strip_cut: self.strip_cut,
             topology: self.topology,
             targets,
-            depth_format: self.depth_format,
+            depth_format,
             samples: self.samples,
         }
     }
@@ -992,51 +1002,69 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
+    #[repr(C)]
+    struct StreamNoPs<D> {
+        root: Sub<*mut std::ffi::c_void>,
+        ms: Sub<D3D12_SHADER_BYTECODE>,
+        blend: Sub<D3D12_BLEND_DESC>,
+        mask: Sub<u32>,
+        raster: Sub<D3D12_RASTERIZER_DESC>,
+        depth: Sub<D>,
+        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+        dsv: Sub<DXGI_FORMAT>,
+        samples: Sub<DXGI_SAMPLE_DESC>,
+        topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+    }
     let mut blend = g.blend;
     for (i, &f) in g.targets.RTFormats.iter().enumerate() {
         if crate::resource::is_integer(f.0 as u32) {
             blend.RenderTarget[i].BlendEnable = false.into();
         }
     }
-    let build = |depth: Sub<_>| {
-        let mut stream = Stream {
-            root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
-            ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
-            ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
-            mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
-            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-            depth,
-            targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-            dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
-            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
-            topology: Sub(
-                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
-                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-            ),
+    macro_rules! build {
+        ($depth:expr) => {
+            if ps.pShaderBytecode.is_null() {
+                let mut stream = StreamNoPs {
+                    root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+                    ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+                    blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
+                    mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+                    raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+                    depth: $depth,
+                    targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
+                    dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+                    samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+                    topology: Sub(
+                        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                        D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    ),
+                };
+                stream_pipeline(device, &mut stream, name)
+            } else {
+                let mut stream = Stream {
+                    root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+                    ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+                    ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+                    blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
+                    mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+                    raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+                    depth: $depth,
+                    targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
+                    dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+                    samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+                    topology: Sub(
+                        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                        D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    ),
+                };
+                stream_pipeline(device, &mut stream, name)
+            }
         };
-        stream_pipeline(device, &mut stream, name)
-    };
+    }
     if depth_bounds {
-        let mut stream = Stream {
-            root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
-            ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
-            ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
-            mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
-            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-            depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
-            targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-            dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
-            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
-            topology: Sub(
-                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
-                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-            ),
-        };
-        stream_pipeline(device, &mut stream, name)
+        build!(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()))
     } else {
-        build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
+        build!(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
     }
 }
 
@@ -1168,15 +1196,13 @@ mod tests {
         assert!(!formats_differ(&declared, &[0; 9]));
         // Run 289: R11G11B10_FLOAT bound where R10G10B10A2_UNORM is declared.
         assert!(formats_differ(&declared, &[26, 28, 0, 0, 0, 0, 0, 0, 40]));
-        // NOT a reason for another pipeline: a view in a slot the pipeline
-        // declares nothing for; another depth format; a depth view where
-        // none is declared.
+        // Depth format difference: triggers a variant so D3D12 DSV format matches.
+        assert!(formats_differ(&declared, &[24, 28, 0, 0, 0, 0, 0, 0, 45]));
+        // A view in a slot past the declared count is not a difference.
         assert!(!formats_differ(&declared, &[24, 28, 28, 0, 0, 0, 0, 0, 40]));
-        assert!(!formats_differ(&declared, &[24, 28, 0, 0, 0, 0, 0, 0, 45]));
-        assert!(!formats_differ(&[24, 0, 0, 0, 0, 0, 0, 0, 0], &[24, 0, 0, 0, 0, 0, 0, 0, 40]));
         // The formats of the pipeline for the bound views: the declared
-        // slots take the bound formats, nothing else moves.
-        assert_eq!(formats_for(&declared, &[26, 28, 28, 0, 0, 0, 0, 0, 45]), [26, 28, 0, 0, 0, 0, 0, 0, 40]);
+        // slots and depth take the bound formats, nothing else moves.
+        assert_eq!(formats_for(&declared, &[26, 28, 28, 0, 0, 0, 0, 0, 45]), [26, 28, 0, 0, 0, 0, 0, 0, 45]);
         assert_eq!(formats_for(&declared, &[26, 0, 0, 0, 0, 0, 0, 0, 0]), [26, 28, 0, 0, 0, 0, 0, 0, 40]);
         assert_eq!(formats_for(&declared, &declared), declared);
     }

@@ -1757,7 +1757,7 @@ void main() {
         }
         let (src_buf, src_ptr, _) = warp.shared_buffer(bytes);
         let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(u64::from(GATHER_MOST) * 4);
-        let (budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_budget_buf, budget_ptr, _budget_gpu) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer(bytes * 2);
         let scratch_a = warp.default_uav(bytes);
         let scratch_b = warp.default_uav(bytes);
@@ -2619,6 +2619,7 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
+        #[allow(dead_code)]
         depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
