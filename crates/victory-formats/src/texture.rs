@@ -1176,4 +1176,35 @@ mod tests {
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
     }
+
+    /// A mip index at or past the layout's own chain is `Invalid`, not a
+    /// read out of bounds: `detile` and `offset` look the mip up by index
+    /// and have nothing to give past the last one. A host copy can be asked
+    /// for a level the console layout no longer holds when its largest
+    /// levels were dropped for it (`VICTORY_TEXTURE_DROP_MIPS`), so the
+    /// uploader keeps the index inside `mips.len()` and zero-fills the rest
+    /// (`victory-gpu` `Staging::detile`).
+    #[test]
+    fn mips_past_the_chain_are_invalid() {
+        let l = Layout::new(&desc(256, 256, 4, 4, Swizzle::SW_4KB_S)).unwrap();
+        assert_eq!(l.mips.len(), 4);
+        let tiled = vec![0u8; l.size as usize];
+        // The last mip the layout holds is fine: 32x32 texels of 4 bytes.
+        let m = &l.mips[3];
+        let (pitch, len) = (
+            (m.width * l.desc.element_bytes) as usize,
+            (m.width * m.height * l.desc.element_bytes) as usize,
+        );
+        let mut out = vec![0u8; len];
+        assert!(l.detile(&tiled, 3, 0, &mut out, pitch, len).is_ok());
+        // One past it, and well past it, are refused rather than read.
+        for mip in [4u32, 5, 9] {
+            assert_eq!(
+                l.detile(&tiled, mip, 0, &mut out, pitch, len),
+                Err(Error::Invalid),
+                "detile mip {mip}"
+            );
+            assert_eq!(l.offset(mip, 1, 0, 0), Err(Error::Invalid), "offset mip {mip}");
+        }
+    }
 }
